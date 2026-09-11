@@ -1,0 +1,953 @@
+diff --git a/src/rtl8372n.c b/src/rtl8372n.c
+index 4eaa8dc..24e3ae8 100644
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -3,6 +3,10 @@
+ #include <linux/if_bridge.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
++#include <linux/bitfield.h>
++#include <linux/dcbnl.h>
++#include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ 
+ #include "rtl837x.h"
+ 
+@@ -22,6 +26,23 @@
+ #define RTL8372N_TRUNK_HASH_L4_SPORT	BIT(5)
+ #define RTL8372N_TRUNK_HASH_L4_DPORT	BIT(6)
+ 
++#define RTL8372N_QOS_PROFILES			2
++#define RTL8372N_QOS_QUEUES				8
++#define RTL8372N_QOS_PRIORITIES			8
++#define RTL8372N_QOS_REMAP_MASK			0x77777777
++#define RTL8372N_QOS_DSCP_REMAP_MASK		GENMASK(29, 0)
++#define RTL8372N_QOS_SCHED_MASK \
++	(RTL8373_SCHED_PORT_Q_CTRL_SET_STRICT_EN_MASK | \
++	 RTL8373_SCHED_PORT_Q_CTRL_SET_WEIGHT_MASK)
++
++#define RTL8372N_QOS_TRUST_PCP			BIT(0)
++#define RTL8372N_QOS_TRUST_DSCP			BIT(1)
++#define RTL8372N_QOS_WEIGHT_PCP			16
++#define RTL8372N_QOS_WEIGHT_SVLAN		8
++#define RTL8372N_QOS_WEIGHT_DSCP		4
++#define RTL8372N_QOS_WEIGHT_ACL			2
++#define RTL8372N_QOS_WEIGHT_PORT		1
++
+ // TODO: this should check port is serdes mode or port mode
+ #define IS_SERDES_PORT(port) (((port)==3)||((port)==8))
+ 
+@@ -277,6 +298,12 @@ struct rtl8372n {
+ 	u16 lag_port_mask[RTL8372N_TRUNK_GROUPS];
+ 	u16 lag_active_mask[RTL8372N_TRUNK_GROUPS];
+ 	u8 lag_hash[RTL8372N_TRUNK_GROUPS];
++	
++	/* QoS */
++	u16 qos_profile_ports[RTL8372N_QOS_PROFILES];
++	u8 qos_profile_sources[RTL8372N_QOS_PROFILES];
++	u8 qos_port_profile[RTL8372N_NUM_PORTS];
++	u32 qos_ets_handle[RTL8372N_NUM_PORTS];
+ };
+ 
+ /*
+@@ -2870,6 +2897,842 @@ static int rtl8372n_lag_fdb_del(struct dsa_switch *ds, struct dsa_lag lag,
+ 	return ret;
+ }
+ 
++struct rtl8372n_qos_port_state {
++	u32 queue_map;
++	u8 scheduler[RTL8372N_QOS_QUEUES];
++	u8 scheduler_algo;
++};
++
++static int rtl8372n_qos_bits_write_verify(struct rtl837x_priv *priv,
++					  u32 reg, u32 mask, u32 value)
++{
++	u32 readback;
++	u32 expected;
++	int ret;
++
++	if (!mask)
++		return -EINVAL;
++
++	expected = value & (mask >> __ffs(mask));
++
++	ret = rtl837x_reg_bits_write(priv, reg, mask, expected);
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_bits_read(priv, reg, mask, &readback);
++	if (ret)
++		return ret;
++
++	return readback == expected ? 0 : -EIO;
++}
++
++static u16 rtl8372n_qos_user_port_mask(struct dsa_switch *ds)
++{
++	struct dsa_port *dp;
++	u16 mask = 0;
++
++	dsa_switch_for_each_user_port(dp, ds)
++		mask |= BIT(dp->index);
++
++	return mask;
++}
++
++static u32 rtl8372n_qos_profile_value(u8 sources)
++{
++	u32 value;
++
++	value = FIELD_PREP(RTL8373_PRI_WEIGHT_PORT_WEIGHT_MASK,
++			   RTL8372N_QOS_WEIGHT_PORT) |
++		FIELD_PREP(RTL8373_PRI_WEIGHT_ACL_WEIGHT_MASK,
++			   RTL8372N_QOS_WEIGHT_ACL) |
++		FIELD_PREP(RTL8373_PRI_WEIGHT_SVLAN_WEIGHT_MASK,
++			   RTL8372N_QOS_WEIGHT_SVLAN);
++
++	if (sources & RTL8372N_QOS_TRUST_PCP)
++		value |= FIELD_PREP(RTL8373_PRI_WEIGHT_DOT1Q_WEIGHT_MASK,
++				    RTL8372N_QOS_WEIGHT_PCP);
++
++	if (sources & RTL8372N_QOS_TRUST_DSCP)
++		value |= FIELD_PREP(RTL8373_PRI_WEIGHT_DSCP_WEIGHT_MASK,
++				    RTL8372N_QOS_WEIGHT_DSCP);
++
++	return value;
++}
++
++static int rtl8372n_qos_profile_write_locked(struct rtl837x_priv *priv,
++					     unsigned int profile, u8 sources)
++{
++	u32 mask;
++
++	if (profile >= RTL8372N_QOS_PROFILES)
++		return -EINVAL;
++
++	mask = RTL8373_PRI_WEIGHT_DOT1Q_WEIGHT_MASK |
++	       RTL8373_PRI_WEIGHT_PORT_WEIGHT_MASK |
++	       RTL8373_PRI_WEIGHT_DSCP_WEIGHT_MASK |
++	       RTL8373_PRI_WEIGHT_ACL_WEIGHT_MASK |
++	       RTL8373_PRI_WEIGHT_SVLAN_WEIGHT_MASK;
++
++	return rtl8372n_qos_bits_write_verify(priv,
++					      RTL8373_PRI_WEIGHT_ADDR(profile),
++					      mask,
++					      rtl8372n_qos_profile_value(sources));
++}
++
++static int rtl8372n_qos_select_profile_locked(struct rtl837x_priv *priv,
++					      int port, unsigned int profile)
++{
++	if (profile >= RTL8372N_QOS_PROFILES)
++		return -EINVAL;
++
++	return rtl8372n_qos_bits_write_verify(priv,
++				RTL8373_PORT_WEIGHT_SEL_ADDR(port),
++				RTL8373_PORT_WEIGHT_SEL_WEIGHT_SEL_MASK(port),
++				profile);
++}
++
++static int rtl8372n_qos_queue_map_write_locked(struct rtl837x_priv *priv,
++						int port,
++						const u8 queue_map[8])
++{
++	u32 value = 0;
++	unsigned int prio;
++
++	for (prio = 0; prio < RTL8372N_QOS_PRIORITIES; prio++) {
++		if (queue_map[prio] >= RTL8372N_QOS_QUEUES)
++			return -EINVAL;
++
++		value |= (u32)queue_map[prio] << (prio * 4);
++	}
++
++	return rtl8372n_qos_bits_write_verify(priv,
++					      RTL8373_QID_TO_PRI_ADDR(port),
++					      RTL8372N_QOS_REMAP_MASK,
++					      value);
++}
++
++static int rtl8372n_qos_queue_map_restore_locked(struct rtl837x_priv *priv,
++						  int port, u32 queue_map)
++{
++	return rtl8372n_qos_bits_write_verify(priv,
++					      RTL8373_QID_TO_PRI_ADDR(port),
++					      RTL8372N_QOS_REMAP_MASK,
++					      queue_map);
++}
++
++static int rtl8372n_qos_scheduler_write_locked(struct rtl837x_priv *priv,
++						int port, unsigned int queue,
++						bool strict, u8 weight)
++{
++	u32 value;
++
++	if (queue >= RTL8372N_QOS_QUEUES)
++		return -EINVAL;
++
++	if (!strict &&
++	    (!weight ||
++	     weight > FIELD_MAX(RTL8373_SCHED_PORT_Q_CTRL_SET_WEIGHT_MASK)))
++		return -ERANGE;
++
++	value = strict ? RTL8373_SCHED_PORT_Q_CTRL_SET_STRICT_EN_MASK :
++			 weight;
++
++	return rtl8372n_qos_bits_write_verify(priv,
++			RTL8373_SCHED_PORT_Q_CTRL_SET_ADDR(port, queue),
++			RTL8372N_QOS_SCHED_MASK, value);
++}
++
++static int rtl8372n_qos_port_state_read_locked(struct rtl837x_priv *priv,
++					       int port,
++					       struct rtl8372n_qos_port_state *state)
++{
++	unsigned int queue;
++	u32 value;
++	int ret;
++
++	ret = rtl837x_reg_read(priv, RTL8373_QID_TO_PRI_ADDR(port),
++			       &state->queue_map);
++	if (ret)
++		return ret;
++
++	state->queue_map &= RTL8372N_QOS_REMAP_MASK;
++
++	for (queue = 0; queue < RTL8372N_QOS_QUEUES; queue++) {
++		ret = rtl837x_reg_bits_read(priv,
++				RTL8373_SCHED_PORT_Q_CTRL_SET_ADDR(port, queue),
++				RTL8372N_QOS_SCHED_MASK, &value);
++		if (ret)
++			return ret;
++
++		state->scheduler[queue] = value;
++	}
++
++	ret = rtl837x_reg_bits_read(priv,
++			RTL8373_SCHED_PORT_ALGO_CTRL_ADDR(port),
++			RTL8373_SCHED_PORT_ALGO_CTRL_SCHED_TYPE_MASK(port),
++			&value);
++	if (ret)
++		return ret;
++
++	state->scheduler_algo = value;
++
++	return 0;
++}
++
++static int rtl8372n_qos_port_state_restore_locked(struct rtl837x_priv *priv,
++						  int port,
++						  const struct rtl8372n_qos_port_state *state)
++{
++	unsigned int queue;
++	int ret;
++
++	ret = rtl8372n_qos_queue_map_restore_locked(priv, port,
++						    state->queue_map);
++	if (ret)
++		return ret;
++
++	for (queue = 0; queue < RTL8372N_QOS_QUEUES; queue++) {
++		ret = rtl8372n_qos_bits_write_verify(priv,
++				RTL8373_SCHED_PORT_Q_CTRL_SET_ADDR(port, queue),
++				RTL8372N_QOS_SCHED_MASK,
++				state->scheduler[queue]);
++		if (ret)
++			return ret;
++	}
++
++	return rtl8372n_qos_bits_write_verify(priv,
++			RTL8373_SCHED_PORT_ALGO_CTRL_ADDR(port),
++			RTL8373_SCHED_PORT_ALGO_CTRL_SCHED_TYPE_MASK(port),
++			state->scheduler_algo);
++}
++
++static int rtl8372n_qos_port_reset_locked(struct rtl837x_priv *priv,
++					  int port)
++{
++	u8 queue_map[RTL8372N_QOS_PRIORITIES];
++	unsigned int queue;
++	int ret;
++
++	ret = rtl8372n_qos_bits_write_verify(priv,
++			RTL8373_SCHED_PORT_ALGO_CTRL_ADDR(port),
++			RTL8373_SCHED_PORT_ALGO_CTRL_SCHED_TYPE_MASK(port),
++			0);
++	if (ret)
++		return ret;
++
++	for (queue = 0; queue < RTL8372N_QOS_QUEUES; queue++)
++		queue_map[queue] = queue;
++
++	ret = rtl8372n_qos_queue_map_write_locked(priv, port, queue_map);
++	if (ret)
++		return ret;
++
++	for (queue = 0; queue < RTL8372N_QOS_QUEUES; queue++) {
++		ret = rtl8372n_qos_scheduler_write_locked(priv, port, queue,
++							   true, 0);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int rtl8372n_qos_set_default_prio_locked(struct rtl837x_priv *priv,
++						int port, u8 prio)
++{
++	u32 old_prio;
++	u32 old_duplicate;
++	int ret;
++
++	if (prio >= RTL8372N_QOS_PRIORITIES)
++		return -EINVAL;
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_PORT_PRI_ADDR(port),
++				    RTL8373_PORT_PRI_PORT_BASE_PRI_MASK(port),
++				    &old_prio);
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_PORT_PRI_DUP_ADDR(port),
++			RTL8373_PORT_PRI_DUP_PORT_BASE_PRI_DUP_MASK(port),
++			&old_duplicate);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_qos_bits_write_verify(priv,
++					     RTL8373_PORT_PRI_ADDR(port),
++					     RTL8373_PORT_PRI_PORT_BASE_PRI_MASK(port),
++					     prio);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_qos_bits_write_verify(priv,
++				RTL8373_PORT_PRI_DUP_ADDR(port),
++				RTL8373_PORT_PRI_DUP_PORT_BASE_PRI_DUP_MASK(port),
++				prio);
++	if (!ret)
++		return 0;
++
++	rtl8372n_qos_bits_write_verify(priv, RTL8373_PORT_PRI_ADDR(port),
++				       RTL8373_PORT_PRI_PORT_BASE_PRI_MASK(port),
++				       old_prio);
++	rtl8372n_qos_bits_write_verify(priv, RTL8373_PORT_PRI_DUP_ADDR(port),
++			RTL8373_PORT_PRI_DUP_PORT_BASE_PRI_DUP_MASK(port),
++			old_duplicate);
++
++	return ret;
++}
++
++static int rtl8372n_qos_hw_init(struct dsa_switch *ds)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct dsa_port *dp;
++	u16 user_mask;
++	unsigned int dscp;
++	int ret = 0;
++
++	user_mask = rtl8372n_qos_user_port_mask(ds);
++
++	mutex_lock(&chip_data->config_lock);
++
++	/*
++	 * PCP maps directly to RTL8372N internal priority. DSCP is global
++	 * hardware state, and defaults to internal priority 0.
++	 */
++	ret = rtl8372n_qos_bits_write_verify(priv,
++					      RTL8373_DOT1Q_PRI_REMAP_ADDR,
++					      RTL8372N_QOS_REMAP_MASK,
++					      0x76543210);
++
++	for (dscp = 0; !ret && dscp < 64; dscp += 10)
++		ret = rtl8372n_qos_bits_write_verify(priv,
++				RTL8373_PRI_SEL_REMAP_DSCP_ADDR(dscp),
++				RTL8372N_QOS_DSCP_REMAP_MASK, 0);
++
++	if (!ret)
++		ret = rtl8372n_qos_profile_write_locked(priv, 0,
++							RTL8372N_QOS_TRUST_PCP);
++	if (!ret)
++		ret = rtl8372n_qos_profile_write_locked(priv, 1,
++							RTL8372N_QOS_TRUST_PCP);
++
++	dsa_switch_for_each_user_port(dp, ds) {
++		if (ret)
++			break;
++
++		ret = rtl8372n_qos_set_default_prio_locked(priv, dp->index, 0);
++		if (!ret)
++			ret = rtl8372n_qos_select_profile_locked(priv, dp->index,
++								  0);
++		if (!ret)
++			ret = rtl8372n_qos_port_reset_locked(priv, dp->index);
++	}
++
++	if (!ret) {
++		memset(chip_data->qos_profile_ports, 0,
++		       sizeof(chip_data->qos_profile_ports));
++		memset(chip_data->qos_profile_sources, 0,
++		       sizeof(chip_data->qos_profile_sources));
++		memset(chip_data->qos_port_profile, 0,
++		       sizeof(chip_data->qos_port_profile));
++		memset(chip_data->qos_ets_handle, 0,
++		       sizeof(chip_data->qos_ets_handle));
++
++		chip_data->qos_profile_ports[0] = user_mask;
++		chip_data->qos_profile_sources[0] =
++			RTL8372N_QOS_TRUST_PCP;
++		chip_data->qos_profile_sources[1] =
++			RTL8372N_QOS_TRUST_PCP;
++	}
++
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int rtl8372n_qos_mqprio_replace_locked(struct dsa_switch *ds,
++					       int port,
++					       struct tc_mqprio_qopt_offload *mqprio)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct tc_mqprio_qopt *qopt = &mqprio->qopt;
++	struct rtl8372n_qos_port_state old_state;
++	u8 queue_map[RTL8372N_QOS_PRIORITIES];
++	unsigned int queue_mask = 0;
++	unsigned int tc;
++	unsigned int prio;
++	int ret;
++
++	if (chip_data->qos_ets_handle[port])
++		return -EBUSY;
++
++	if (mqprio->mode != TC_MQPRIO_MODE_DCB ||
++	    mqprio->shaper != TC_MQPRIO_SHAPER_DCB)
++		return -EOPNOTSUPP;
++
++	if (!qopt->num_tc || qopt->num_tc > RTL8372N_QOS_QUEUES)
++		return -EINVAL;
++
++	/*
++	 * RTL8372N has eight physical queues, but its priority-to-queue
++	 * table selects exactly one queue for each internal priority.
++	 * Therefore a traffic class must own exactly one hardware queue.
++	 */
++	for (tc = 0; tc < qopt->num_tc; tc++) {
++		if (qopt->count[tc] != 1 ||
++		    qopt->offset[tc] >= RTL8372N_QOS_QUEUES)
++			return -EOPNOTSUPP;
++
++		if (queue_mask & BIT(qopt->offset[tc]))
++			return -EINVAL;
++
++		queue_mask |= BIT(qopt->offset[tc]);
++	}
++
++	for (prio = 0; prio < RTL8372N_QOS_PRIORITIES; prio++) {
++		tc = qopt->prio_tc_map[prio];
++		if (tc >= qopt->num_tc)
++			return -EINVAL;
++
++		queue_map[prio] = qopt->offset[tc];
++	}
++
++	ret = rtl8372n_qos_port_state_read_locked(priv, port, &old_state);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_qos_queue_map_write_locked(priv, port, queue_map);
++	if (!ret)
++		return 0;
++
++	if (rtl8372n_qos_port_state_restore_locked(priv, port, &old_state))
++		dev_err(priv->dev,
++			"failed to restore QoS queue map after mqprio error\n");
++
++	return ret;
++}
++
++static int rtl8372n_qos_mqprio_destroy_locked(struct dsa_switch *ds, int port)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct rtl8372n_qos_port_state old_state;
++	int ret;
++
++	if (chip_data->qos_ets_handle[port])
++		return -EBUSY;
++
++	ret = rtl8372n_qos_port_state_read_locked(priv, port, &old_state);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_qos_port_reset_locked(priv, port);
++	if (!ret)
++		return 0;
++
++	if (rtl8372n_qos_port_state_restore_locked(priv, port, &old_state))
++		dev_err(priv->dev,
++			"failed to restore QoS state after mqprio destroy error\n");
++
++	return ret;
++}
++
++static int rtl8372n_qos_mqprio_locked(struct dsa_switch *ds, int port,
++				       struct tc_mqprio_qopt_offload *mqprio)
++{
++	/* A num_tc of 0 signifies that the MQPRIO qdisc is being destroyed/removed */
++	if (mqprio->qopt.num_tc == 0) {
++		return rtl8372n_qos_mqprio_destroy_locked(ds, port);
++	}
++
++	/* A non-zero num_tc signifies that a qdisc configuration is being added/replaced */
++	return rtl8372n_qos_mqprio_replace_locked(ds, port, mqprio);
++}
++
++static int rtl8372n_qos_ets_replace_locked(struct dsa_switch *ds, int port,
++					    struct tc_ets_qopt_offload *qopt)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct tc_ets_qopt_offload_replace_params *params =
++		&qopt->replace_params;
++	struct rtl8372n_qos_port_state old_state;
++	u8 queue_map[RTL8372N_QOS_PRIORITIES];
++	unsigned int band;
++	unsigned int prio;
++	unsigned int queue;
++	int ret;
++
++	if (qopt->parent != TC_H_ROOT ||
++	    params->bands != RTL8372N_QOS_QUEUES)
++		return -EOPNOTSUPP;
++
++	for (prio = 0; prio < RTL8372N_QOS_PRIORITIES; prio++) {
++		band = params->priomap[prio];
++		if (band >= RTL8372N_QOS_QUEUES)
++			return -EINVAL;
++
++		/*
++		 * Linux band 0 is highest priority. RTL8372N queue 7 is
++		 * used as the corresponding highest-priority hardware queue.
++		 */
++		queue_map[prio] = RTL8372N_QOS_QUEUES - 1 - band;
++	}
++
++	for (band = 0; band < RTL8372N_QOS_QUEUES; band++) {
++		if (!params->quanta[band])
++			continue;
++
++		if (!params->weights[band] ||
++		    params->weights[band] >
++			FIELD_MAX(RTL8373_SCHED_PORT_Q_CTRL_SET_WEIGHT_MASK))
++			return -ERANGE;
++	}
++
++	ret = rtl8372n_qos_port_state_read_locked(priv, port, &old_state);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_qos_queue_map_write_locked(priv, port, queue_map);
++
++	for (band = 0; !ret && band < RTL8372N_QOS_QUEUES; band++) {
++		queue = RTL8372N_QOS_QUEUES - 1 - band;
++
++		ret = rtl8372n_qos_scheduler_write_locked(priv, port, queue,
++							   !params->quanta[band],
++							   params->weights[band]);
++	}
++
++	if (ret) {
++		if (rtl8372n_qos_port_state_restore_locked(priv, port,
++							    &old_state))
++			dev_err(priv->dev,
++				"failed to restore QoS state after ETS error\n");
++		return ret;
++	}
++
++	chip_data->qos_ets_handle[port] = qopt->handle;
++
++	return 0;
++}
++
++static int rtl8372n_qos_ets_destroy_locked(struct dsa_switch *ds, int port)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct rtl8372n_qos_port_state old_state;
++	int ret;
++
++	ret = rtl8372n_qos_port_state_read_locked(priv, port, &old_state);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_qos_port_reset_locked(priv, port);
++	if (ret) {
++		if (rtl8372n_qos_port_state_restore_locked(priv, port,
++							    &old_state))
++			dev_err(priv->dev,
++				"failed to restore QoS state after ETS destroy error\n");
++		return ret;
++	}
++
++	chip_data->qos_ets_handle[port] = 0;
++
++	return 0;
++}
++
++static int rtl8372n_qos_ets_locked(struct dsa_switch *ds, int port,
++				   struct tc_ets_qopt_offload *qopt)
++{
++	switch (qopt->command) {
++	case TC_ETS_REPLACE:
++		return rtl8372n_qos_ets_replace_locked(ds, port, qopt);
++	case TC_ETS_DESTROY:
++		return rtl8372n_qos_ets_destroy_locked(ds, port);
++	case TC_ETS_STATS:
++	case TC_ETS_GRAFT:
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int rtl8372n_port_setup_tc(struct dsa_switch *ds, int port,
++				  enum tc_setup_type type, void *type_data)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	int ret;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&chip_data->config_lock);
++
++	switch (type) {
++	case TC_SETUP_QDISC_MQPRIO:
++		ret = rtl8372n_qos_mqprio_locked(ds, port, type_data);
++		break;
++	case TC_SETUP_QDISC_ETS:
++		ret = rtl8372n_qos_ets_locked(ds, port, type_data);
++		break;
++	default:
++		ret = -EOPNOTSUPP;
++		break;
++	}
++
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int rtl8372n_port_get_default_prio(struct dsa_switch *ds, int port)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	u32 prio;
++	u32 duplicate;
++	int ret;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&chip_data->config_lock);
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_PORT_PRI_ADDR(port),
++				    RTL8373_PORT_PRI_PORT_BASE_PRI_MASK(port),
++				    &prio);
++	if (!ret)
++		ret = rtl837x_reg_bits_read(priv,
++				RTL8373_PORT_PRI_DUP_ADDR(port),
++				RTL8373_PORT_PRI_DUP_PORT_BASE_PRI_DUP_MASK(port),
++				&duplicate);
++
++	mutex_unlock(&chip_data->config_lock);
++
++	if (ret)
++		return ret;
++
++	return prio == duplicate ? prio : -EIO;
++}
++
++static int rtl8372n_port_set_default_prio(struct dsa_switch *ds, int port,
++					  u8 prio)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	int ret;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&chip_data->config_lock);
++	ret = rtl8372n_qos_set_default_prio_locked(priv, port, prio);
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int rtl8372n_port_get_dscp_prio(struct dsa_switch *ds, int port,
++				       u8 dscp)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	int ret;
++	u32 prio;
++
++	if (!rtl8372n_port_is_user(ds, port) || dscp >= 64)
++		return -EINVAL;
++
++	mutex_lock(&chip_data->config_lock);
++	ret = rtl837x_reg_bits_read(priv,
++				    RTL8373_PRI_SEL_REMAP_DSCP_ADDR(dscp),
++				    RTL8373_PRI_SEL_REMAP_DSCP_INTPRI_DSCP_MASK(dscp),
++				    &prio);
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret ? ret : prio;
++}
++
++static int rtl8372n_port_add_dscp_prio(struct dsa_switch *ds, int port,
++				       u8 dscp, u8 prio)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	int ret;
++
++	if (!rtl8372n_port_is_user(ds, port) ||
++	    dscp >= 64 || prio >= RTL8372N_QOS_PRIORITIES)
++		return -EINVAL;
++
++	mutex_lock(&chip_data->config_lock);
++	ret = rtl8372n_qos_bits_write_verify(priv,
++				RTL8373_PRI_SEL_REMAP_DSCP_ADDR(dscp),
++				RTL8373_PRI_SEL_REMAP_DSCP_INTPRI_DSCP_MASK(dscp),
++				prio);
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int rtl8372n_port_del_dscp_prio(struct dsa_switch *ds, int port,
++				       u8 dscp, u8 prio)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	u32 current_prio;
++	int ret;
++
++	if (!rtl8372n_port_is_user(ds, port) ||
++	    dscp >= 64 || prio >= RTL8372N_QOS_PRIORITIES)
++		return -EINVAL;
++
++	mutex_lock(&chip_data->config_lock);
++
++	ret = rtl837x_reg_bits_read(priv,
++				    RTL8373_PRI_SEL_REMAP_DSCP_ADDR(dscp),
++				    RTL8373_PRI_SEL_REMAP_DSCP_INTPRI_DSCP_MASK(dscp),
++				    &current_prio);
++	if (!ret && current_prio == prio)
++		ret = rtl8372n_qos_bits_write_verify(priv,
++				RTL8373_PRI_SEL_REMAP_DSCP_ADDR(dscp),
++				RTL8373_PRI_SEL_REMAP_DSCP_INTPRI_DSCP_MASK(dscp),
++				0);
++
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int rtl8372n_qos_apptrust_sources(const u8 *sel, int nsel,
++					 u8 *sources)
++{
++	bool pcp = false;
++	bool dscp = false;
++	int i;
++
++	if (nsel < 0)
++		return -EINVAL;
++
++	*sources = 0;
++
++	for (i = 0; i < nsel; i++) {
++		switch (sel[i]) {
++		case DCB_APP_SEL_PCP:
++			if (pcp)
++				return -EINVAL;
++			pcp = true;
++			*sources |= RTL8372N_QOS_TRUST_PCP;
++			break;
++		case IEEE_8021QAZ_APP_SEL_DSCP:
++			if (dscp)
++				return -EINVAL;
++			dscp = true;
++			*sources |= RTL8372N_QOS_TRUST_DSCP;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++	}
++
++	return 0;
++}
++
++static int rtl8372n_port_set_apptrust(struct dsa_switch *ds, int port,
++				      const u8 *sel, int nsel)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	unsigned int old_profile;
++	unsigned int target;
++	u8 sources;
++	int ret;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	ret = rtl8372n_qos_apptrust_sources(sel, nsel, &sources);
++	if (ret)
++		return ret;
++
++	mutex_lock(&chip_data->config_lock);
++
++	old_profile = chip_data->qos_port_profile[port];
++	if (chip_data->qos_profile_sources[old_profile] == sources) {
++		ret = 0;
++		goto out_unlock;
++	}
++
++	for (target = 0; target < RTL8372N_QOS_PROFILES; target++) {
++		if (chip_data->qos_profile_ports[target] &&
++		    chip_data->qos_profile_sources[target] == sources)
++			break;
++	}
++
++	if (target == RTL8372N_QOS_PROFILES) {
++		for (target = 0; target < RTL8372N_QOS_PROFILES; target++) {
++			if (!chip_data->qos_profile_ports[target] ||
++			    chip_data->qos_profile_ports[target] == BIT(port))
++				break;
++		}
++	}
++
++	if (target == RTL8372N_QOS_PROFILES) {
++		ret = -ENOSPC;
++		goto out_unlock;
++	}
++
++	if (!chip_data->qos_profile_ports[target] ||
++	    chip_data->qos_profile_ports[target] == BIT(port)) {
++		ret = rtl8372n_qos_profile_write_locked(priv, target, sources);
++		if (ret)
++			goto out_unlock;
++	}
++
++	if (target != old_profile) {
++		ret = rtl8372n_qos_select_profile_locked(priv, port, target);
++		if (ret)
++			goto out_unlock;
++	}
++
++	chip_data->qos_profile_ports[old_profile] &= ~BIT(port);
++	chip_data->qos_profile_ports[target] |= BIT(port);
++	chip_data->qos_profile_sources[target] = sources;
++	chip_data->qos_port_profile[port] = target;
++
++out_unlock:
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int rtl8372n_port_get_apptrust(struct dsa_switch *ds, int port,
++				      u8 *sel, int *nsel)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	u8 sources;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&chip_data->config_lock);
++	sources = chip_data->qos_profile_sources[
++		chip_data->qos_port_profile[port]];
++	mutex_unlock(&chip_data->config_lock);
++
++	*nsel = 0;
++
++	if (sources & RTL8372N_QOS_TRUST_PCP)
++		sel[(*nsel)++] = DCB_APP_SEL_PCP;
++
++	if (sources & RTL8372N_QOS_TRUST_DSCP)
++		sel[(*nsel)++] = IEEE_8021QAZ_APP_SEL_DSCP;
++
++	return 0;
++}
++
+ enum RTL8373_MSTP_STATE
+ {
+     MSTP_DISABLE = 0,
+@@ -3205,6 +4068,10 @@ static int rtl8372n_setup(struct dsa_switch *ds)
+ 	ret = rtl8372n_set_vlan_4k(priv, &def_vlan);
+ 	if (ret)
+ 		return ret;
++	
++	ret = rtl8372n_qos_hw_init(ds);
++	if (ret)
++		return ret;
+ 
+ 	/*
+ 	 * Warning! 
+@@ -3419,6 +4286,15 @@ static const struct dsa_switch_ops rtl8372n_switch_ops_mdio = {
+ 	.port_lag_change = rtl8372n_port_lag_change,
+ 	.lag_fdb_add     = rtl8372n_lag_fdb_add,
+ 	.lag_fdb_del     = rtl8372n_lag_fdb_del,
++	
++	.port_setup_tc = rtl8372n_port_setup_tc,
++	.port_get_default_prio = rtl8372n_port_get_default_prio,
++	.port_set_default_prio = rtl8372n_port_set_default_prio,
++	.port_get_dscp_prio = rtl8372n_port_get_dscp_prio,
++	.port_add_dscp_prio = rtl8372n_port_add_dscp_prio,
++	.port_del_dscp_prio = rtl8372n_port_del_dscp_prio,
++	.port_set_apptrust = rtl8372n_port_set_apptrust,
++	.port_get_apptrust = rtl8372n_port_get_apptrust,
+ 
+ 	.tag_8021q_vlan_add = rtl8372n_tag_8021q_vlan_add,
+ 	.tag_8021q_vlan_del = rtl8372n_tag_8021q_vlan_del,
+@@ -3447,5 +4323,6 @@ const struct rtl837x_variant rtl8372n_variant = {
+ 	.num_lag_ids = RTL8372N_TRUNK_GROUPS,
+ 	.have_8224 = false,
+ 	.chip_data_sz = sizeof(struct rtl8372n),
++	.dscp_prio_mapping_is_global = true,
+ };
+ EXPORT_SYMBOL_GPL(rtl8372n_variant);
+diff --git a/src/rtl837x.h b/src/rtl837x.h
+index 02489b0..928b6ca 100644
+--- a/src/rtl837x.h
++++ b/src/rtl837x.h
+@@ -210,6 +210,7 @@ struct rtl837x_variant {
+ 	const bool have_8224;
+ 	size_t chip_data_sz;
+ 	unsigned int num_lag_ids;
++	bool dscp_prio_mapping_is_global;
+ };
+ 
+ struct rtl837x_ops {
+diff --git a/src/rtl837x_mdio.c b/src/rtl837x_mdio.c
+index b95272c..d7b86df 100644
+--- a/src/rtl837x_mdio.c
++++ b/src/rtl837x_mdio.c
+@@ -281,6 +281,7 @@ static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
+ 	priv->ds->priv = priv;
+ 	priv->ds->ops = var->ds_ops_mdio;
+ 	priv->ds->num_lag_ids = var->num_lag_ids;
++	priv->ds->dscp_prio_mapping_is_global =	var->dscp_prio_mapping_is_global;
+ 	if (var->pl_mac_ops)
+ 		priv->ds->phylink_mac_ops = var->pl_mac_ops;
+ 	
