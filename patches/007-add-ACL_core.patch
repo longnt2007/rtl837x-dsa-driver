@@ -1,0 +1,1165 @@
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -2,10 +2,16 @@
+ #include <linux/math64.h>
+ #include <linux/regmap.h>
+ #include <linux/if_bridge.h>
++#include <linux/if_vlan.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
++#include <linux/bitmap.h>
+ #include <linux/bitfield.h>
+ #include <linux/dcbnl.h>
++#include <linux/jiffies.h>
++#include <linux/unaligned.h>
++#include <net/dsa.h>
++#include <net/flow_offload.h>
+ #include <net/pkt_sched.h>
+ #include <net/pkt_cls.h>
+ 
+@@ -54,6 +60,32 @@
+ #define RTL8372N_IGBW_BURST_MIN			2
+ #define RTL8372N_IGBW_BURST_MASK		0x7fffffffU
+ 
++#define RTL8372N_ACL_RULES				96
++#define RTL8372N_ACL_COUNTERS			32
++#define RTL8372N_ACL_FIELDS				8
++#define RTL8372N_ACL_RULE_WORDS			5
++#define RTL8372N_ACL_ACTION_WORDS		3
++#define RTL8372N_ACL_TEMPLATES			5
++#define RTL8372N_ACL_RULE_TARGET		1
++#define RTL8372N_ACL_ACTION_TARGET		2
++#define RTL8372N_ACL_FIELD_SELECTOR_BASE	0x6f58
++#define RTL8372N_ACL_FIELD_SELECTOR_STRIDE	4
++
++#define RTL8372N_ACL_RULE_VALID			BIT(21)
++#define RTL8372N_ACL_RULE_INFO_MASK		GENMASK(20, 0)
++#define RTL8372N_ACL_TEMPLATE_MASK		GENMASK(2, 0)
++#define RTL8372N_ACL_ACTIVE_PORT_SHIFT	11
++#define RTL8372N_ACL_ALL_PORT_MASK		GENMASK(9, 0)
++#define RTL8372N_ACL_ACTION_CTRL_MASK	GENMASK(8, 0)
++#define RTL8372N_ACL_ACTION_POLIC_LOG	BIT(4)
++#define RTL8372N_ACL_ACTION_FWD			BIT(5)
++#define RTL8372N_ACL_LOG_SELECT			BIT(16)
++#define RTL8372N_ACL_COUNTER_INDEX_MASK	GENMASK(15, 10)
++#define RTL8372N_ACL_FWD_ACTION_MASK	GENMASK(19, 17)
++#define RTL8372N_ACL_FWD_PORT_MASK		GENMASK(30, 21)
++#define RTL8372N_ACL_FWD_REDIRECT		1
++#define RTL8372N_ACL_TEMPLATE_L2		0
++
+ // TODO: this should check port is serdes mode or port mode
+ #define IS_SERDES_PORT(port) (((port)==3)||((port)==8))
+ 
+@@ -272,6 +304,28 @@ struct rtl8372n_pcs
+ 	int index;
+ };
+ 
++struct rtl8372n_acl_match {
++	u16 data[RTL8372N_ACL_FIELDS];
++	u16 mask[RTL8372N_ACL_FIELDS];
++	u32 info_data;
++	u32 info_mask;
++};
++
++struct rtl8372n_acl_entry {
++	struct rtl8372n_acl_match match;
++	unsigned long cookie;
++	unsigned long lastused;
++	u32 action[RTL8372N_ACL_ACTION_WORDS];
++	u32 action_ctrl;
++	u32 priority;
++	u32 counter_last;
++	u8 port;
++	u8 counter;
++	bool stats_enabled;
++	bool counter_valid;
++	bool trap;
++};
++
+ struct rtl8372n {
+ 	struct rtl8372n_pcs pcs[RTL8372N_NUM_PORTS];
+ 	netdev_features_t csum_feature_backup;
+@@ -317,6 +371,13 @@ struct rtl8372n {
+ 	u32 qos_ets_handle[RTL8372N_NUM_PORTS];
+ 	u32 qos_tbf_root_handle[RTL8372N_NUM_PORTS];
+ 	u32 qos_tbf_queue_handle[RTL8372N_NUM_PORTS][RTL8372N_QOS_QUEUES];
++	
++	/* ACL */
++	struct rtl8372n_acl_entry acl[RTL8372N_ACL_RULES];
++	DECLARE_BITMAP(acl_counter_used, RTL8372N_ACL_COUNTERS);
++	unsigned int acl_count;
++	unsigned int acl_hw_count;
++	unsigned int acl_trap_count;
+ };
+ 
+ /*
+@@ -1288,6 +1349,13 @@ static int rtl8372n_change_tag_protocol(
+ 
+ 	mutex_lock(&chip_data->config_lock);
+ 
++	if (proto != DSA_TAG_PROTO_RTL8_4 && chip_data->acl_trap_count) {
++		dev_warn(priv->dev,
++			 "cannot leave RTL8_4 while ACL trap rules are active\n");
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
+ 	switch (proto) {
+ 	case DSA_TAG_PROTO_MXL862_8021Q:
+ 		ret = rtl8372n_teardown_tag_rtl(ds);
+@@ -1310,6 +1378,7 @@ static int rtl8372n_change_tag_protocol(
+ 	}
+ 	priv->tag_proto = proto;
+ 
++out_unlock:
+ 	mutex_unlock(&chip_data->config_lock);
+ 
+ 	return 0;
+@@ -4424,6 +4493,1006 @@ static int rtl8372n_port_get_apptrust(st
+ 	return 0;
+ }
+ 
++static const u8 rtl8372n_acl_templates[RTL8372N_ACL_TEMPLATES]
++				      [RTL8372N_ACL_FIELDS] = {
++	{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x4f },
++	{ 0x10, 0x11, 0x12, 0x13, 0x34, 0x35, 0x36, 0x40 },
++	{ 0x12, 0x13, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45 },
++	{ 0x10, 0x11, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b },
++	{ 0x30, 0x31, 0x32, 0x08, 0x07, 0x41, 0x42, 0x33 },
++};
++
++/* Parser format: bits [2:0] are parser type; bits [10:3] are byte offset. */
++static const u16 rtl8372n_acl_field_selectors[] = {
++	0x0c5, 0x0d5, 0x0e5, 0x0f5,
++	0x105, 0x115, 0x045, 0x055,
++	0x065, 0x075, 0x085, 0x095,
++	0x033, 0x006, 0x016, 0x000,
++};
++
++static u16 rtl8372n_acl_user_port_mask(struct dsa_switch *ds)
++{
++	struct dsa_port *dp;
++	u16 mask = 0;
++
++	dsa_switch_for_each_user_port(dp, ds)
++		mask |= BIT(dp->index);
++
++	return mask;
++}
++
++/*
++ * The RTL8372N VLAN/LUT/ACL table engines share ITA_CTRL0. The caller must
++ * hold priv->ita_lock for the entire ACL sequence, not merely for a single
++ * regmap transaction.
++ */
++static int
++rtl8372n_acl_table_access_locked(struct rtl837x_priv *priv, u8 target,
++				 u16 address, bool write, u32 *words,
++				 unsigned int count)
++{
++	u32 command;
++	u32 value;
++	unsigned int i;
++	int ret;
++
++	if (!count || count > RTL8372N_ACL_RULE_WORDS)
++		return -EINVAL;
++
++	ret = regmap_read_poll_timeout(priv->map, RTL8373_ITA_CTRL0_ADDR,
++				       value,
++				       !(value & RTL8373_ITA_CTRL0_TLB_EXECUTE_MASK),
++				       10, 10000);
++	if (ret)
++		return ret;
++
++	if (write) {
++		for (i = 0; i < count; i++) {
++			ret = rtl837x_reg_write(priv,
++						 RTL8373_ITA_WRITE_DATA0_ADDR(i),
++						 words[i]);
++			if (ret)
++				return ret;
++		}
++	}
++
++	command = FIELD_PREP(RTL8373_ITA_CTRL0_TBL_ADDR_MASK, address) |
++		  FIELD_PREP(RTL8373_ITA_CTRL0_TLB_TYPE_MASK, target) |
++		  FIELD_PREP(RTL8373_ITA_CTRL0_TLB_ACT_MASK, write ? 1 : 0) |
++		  FIELD_PREP(RTL8373_ITA_CTRL0_TLB_EXECUTE_MASK, 1);
++
++	ret = rtl837x_reg_write(priv, RTL8373_ITA_CTRL0_ADDR, command);
++	if (ret)
++		return ret;
++
++	ret = regmap_read_poll_timeout(priv->map, RTL8373_ITA_CTRL0_ADDR,
++				       value,
++				       !(value & RTL8373_ITA_CTRL0_TLB_EXECUTE_MASK),
++				       10, 10000);
++	if (ret || write)
++		return ret;
++
++	for (i = 0; i < count; i++) {
++		ret = rtl837x_reg_read(priv, RTL8373_ITA_READ_DATA0_ADDR(i),
++				       &words[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static void
++rtl8372n_acl_encode_rule(const struct rtl8372n_acl_match *match, bool valid,
++			 u32 data[RTL8372N_ACL_RULE_WORDS],
++			 u32 care[RTL8372N_ACL_RULE_WORDS])
++{
++	unsigned int i;
++	u32 raw_data;
++	u32 raw_mask;
++
++	for (i = 0; i < RTL8372N_ACL_FIELDS / 2; i++) {
++		raw_data = match->data[i * 2] |
++			   (u32)match->data[i * 2 + 1] << 16;
++		raw_mask = match->mask[i * 2] |
++			   (u32)match->mask[i * 2 + 1] << 16;
++
++		care[i] = ~raw_mask | ~raw_data;
++		data[i] = ~raw_mask | raw_data;
++	}
++
++	care[4] = ~match->info_mask | ~match->info_data;
++	data[4] = ~match->info_mask | match->info_data;
++
++	if (valid)
++		data[4] |= RTL8372N_ACL_RULE_VALID;
++	else
++		data[4] &= ~RTL8372N_ACL_RULE_VALID;
++}
++
++static int
++rtl8372n_acl_counter_reset_locked(struct rtl837x_priv *priv,
++				  unsigned int counter, u32 *value)
++{
++	int ret;
++
++	if (counter >= RTL8372N_ACL_COUNTERS)
++		return -EINVAL;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_CNTR_RST_VAL_ADDR, 0);
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_LOG_CNTR_RST_ADDR,
++				BIT(counter));
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_LOG_CNTR_RST_ADDR, 0);
++	if (ret)
++		return ret;
++
++	return rtl837x_reg_read(priv, RTL8373_ACL_LOG_CNTR_DATA_ADDR(counter),
++				value);
++}
++
++static int
++rtl8372n_acl_counter_read_locked(struct rtl837x_priv *priv,
++				 unsigned int counter, u32 *value)
++{
++	if (counter >= RTL8372N_ACL_COUNTERS)
++		return -EINVAL;
++
++	return rtl837x_reg_read(priv, RTL8373_ACL_LOG_CNTR_DATA_ADDR(counter),
++				value);
++}
++
++static int
++rtl8372n_acl_rule_clear_locked(struct rtl837x_priv *priv, unsigned int index)
++{
++	struct rtl8372n_acl_match match = {};
++	u32 data[RTL8372N_ACL_RULE_WORDS];
++	u32 care[RTL8372N_ACL_RULE_WORDS];
++	u32 action[RTL8372N_ACL_ACTION_WORDS] = {};
++	int ret;
++
++	if (index >= RTL8372N_ACL_RULES)
++		return -EINVAL;
++
++	rtl8372n_acl_encode_rule(&match, false, data, care);
++
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_RULE_TARGET,
++					       BIT(7) | index, true, data,
++					       ARRAY_SIZE(data));
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_RULE_TARGET,
++					       index, true, care,
++					       ARRAY_SIZE(care));
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_ACT_CTRL_ADDR(index), 0);
++	if (ret)
++		return ret;
++
++	return rtl8372n_acl_table_access_locked(priv,
++						 RTL8372N_ACL_ACTION_TARGET,
++						 index, true, action,
++						 ARRAY_SIZE(action));
++}
++
++static int
++rtl8372n_acl_rule_write_locked(struct rtl837x_priv *priv,
++				unsigned int index,
++				const struct rtl8372n_acl_entry *entry)
++{
++	u32 data[RTL8372N_ACL_RULE_WORDS];
++	u32 care[RTL8372N_ACL_RULE_WORDS];
++	u32 readback[RTL8372N_ACL_RULE_WORDS];
++	u32 invalid[RTL8372N_ACL_RULE_WORDS];
++	u32 action[RTL8372N_ACL_ACTION_WORDS];
++	u32 action_ctrl;
++	int ret;
++
++	if (index >= RTL8372N_ACL_RULES)
++		return -EINVAL;
++
++	rtl8372n_acl_encode_rule(&entry->match, true, data, care);
++
++	memcpy(invalid, data, sizeof(invalid));
++	invalid[4] &= ~RTL8372N_ACL_RULE_VALID;
++
++	/*
++	 * Program an invalid rule first. It becomes active only after match,
++	 * care bits and action have all been committed successfully.
++	 */
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_RULE_TARGET,
++					       BIT(7) | index, true, invalid,
++					       ARRAY_SIZE(invalid));
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_RULE_TARGET,
++					       index, true, care,
++					       ARRAY_SIZE(care));
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_ACT_CTRL_ADDR(index),
++				entry->action_ctrl);
++	if (ret)
++		return ret;
++
++	memcpy(action, entry->action, sizeof(action));
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_ACTION_TARGET,
++					       index, true, action,
++					       ARRAY_SIZE(action));
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_RULE_TARGET,
++					       BIT(7) | index, true, data,
++					       ARRAY_SIZE(data));
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_RULE_TARGET,
++					       BIT(7) | index, false, readback,
++					       ARRAY_SIZE(readback));
++	if (ret)
++		return ret;
++
++	if (memcmp(readback, data, sizeof(data[0]) * 4) ||
++	    ((readback[4] & (RTL8372N_ACL_RULE_INFO_MASK |
++			     RTL8372N_ACL_RULE_VALID)) !=
++	     (data[4] & (RTL8372N_ACL_RULE_INFO_MASK |
++			 RTL8372N_ACL_RULE_VALID))))
++		return -EIO;
++
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_RULE_TARGET,
++					       index, false, readback,
++					       ARRAY_SIZE(readback));
++	if (ret)
++		return ret;
++
++	if (memcmp(readback, care, sizeof(care[0]) * 4) ||
++	    ((readback[4] & RTL8372N_ACL_RULE_INFO_MASK) !=
++	     (care[4] & RTL8372N_ACL_RULE_INFO_MASK)))
++		return -EIO;
++
++	ret = rtl8372n_acl_table_access_locked(priv,
++					       RTL8372N_ACL_ACTION_TARGET,
++					       index, false, readback,
++					       RTL8372N_ACL_ACTION_WORDS);
++	if (ret)
++		return ret;
++
++	if (memcmp(readback, action, sizeof(action)))
++		return -EIO;
++
++	ret = rtl837x_reg_read(priv, RTL8373_ACL_ACT_CTRL_ADDR(index),
++			       &action_ctrl);
++	if (ret)
++		return ret;
++
++	return (action_ctrl & RTL8372N_ACL_ACTION_CTRL_MASK) ==
++	       entry->action_ctrl ? 0 : -EIO;
++}
++
++/*
++ * Caller holds chip_data->config_lock. Take ita_lock around the full ACL
++ * sync range, because each ACL rule needs several ITA transactions.
++ *
++ * Only entries at index >= from are rewritten. Callers must guarantee that
++ * chip_data->acl[0..from) is byte-for-byte identical, at the same indices,
++ * to what the last successful sync programmed into hardware — this is true
++ * as long as the only mutations between syncs are memmove()s of a
++ * contiguous suffix starting at or after `from`.
++ */
++static int rtl8372n_acl_sync_range_locked(struct dsa_switch *ds,
++					   unsigned int from)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	unsigned int old_count = chip_data->acl_hw_count;
++	unsigned int index;
++	int ret = 0;
++
++	if (from > chip_data->acl_count && from > old_count)
++		from = min(chip_data->acl_count, old_count);
++
++	mutex_lock(&priv->ita_lock);
++
++	for (index = from; index < chip_data->acl_count; index++) {
++		ret = rtl8372n_acl_rule_write_locked(priv, index,
++						     &chip_data->acl[index]);
++		if (ret)
++			goto out_unlock;
++	}
++
++	for (index = max(from, chip_data->acl_count); index < old_count;
++	     index++) {
++		ret = rtl8372n_acl_rule_clear_locked(priv, index);
++		if (ret)
++			goto out_unlock;
++	}
++
++	chip_data->acl_hw_count = chip_data->acl_count;
++
++out_unlock:
++	mutex_unlock(&priv->ita_lock);
++
++	return ret;
++}
++
++static int rtl8372n_acl_sync_locked(struct dsa_switch *ds)
++{
++	return rtl8372n_acl_sync_range_locked(ds, 0);
++}
++
++static int rtl8372n_acl_hw_init(struct dsa_switch *ds)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	u16 user_ports = rtl8372n_acl_user_port_mask(ds);
++	u32 value;
++	u32 readback;
++	unsigned int index;
++	int ret;
++
++	mutex_lock(&chip_data->config_lock);
++
++	for (index = 0; index < RTL8372N_ACL_RULES; index++) {
++		ret = rtl837x_reg_write(priv, RTL8373_ACL_ACT_CTRL_ADDR(index),
++					0);
++		if (ret)
++			goto out_unlock;
++	}
++
++	ret = rtl837x_reg_bits_write(priv, RTL8373_ACL_CTRL_ADDR,
++				     RTL8373_ACL_CTRL_TABLE_RST_MASK, 1);
++	if (ret)
++		goto out_unlock;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_LOG_CNTR_TYPE_ADDR, 0);
++	if (ret)
++		goto out_unlock;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_LOG_CNTR_MODE_ADDR, 0);
++	if (ret)
++		goto out_unlock;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_CNTR_RST_VAL_ADDR, 0);
++	if (ret)
++		goto out_unlock;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_LOG_CNTR_RST_ADDR,
++				GENMASK(RTL8372N_ACL_COUNTERS - 1, 0));
++	if (ret)
++		goto out_unlock;
++
++	ret = rtl837x_reg_write(priv, RTL8373_ACL_LOG_CNTR_RST_ADDR, 0);
++	if (ret)
++		goto out_unlock;
++
++	for (index = 0; index < RTL8372N_ACL_TEMPLATES; index++) {
++		value = get_unaligned_le32(&rtl8372n_acl_templates[index][4]);
++		ret = rtl837x_reg_write(priv,
++					RTL8373_ACL_TEMPLATE_CTRL_ADDR(index),
++					value);
++		if (ret)
++			goto out_unlock;
++
++		value = get_unaligned_le32(&rtl8372n_acl_templates[index][0]);
++		ret = rtl837x_reg_write(priv,
++					RTL8373_ACL_TEMPLATE_CTRL_ADDR(index) + 4,
++					value);
++		if (ret)
++			goto out_unlock;
++	}
++
++	for (index = 0; index < ARRAY_SIZE(rtl8372n_acl_field_selectors);
++	     index++) {
++		ret = rtl837x_reg_write(priv,
++					RTL8372N_ACL_FIELD_SELECTOR_BASE +
++					index * RTL8372N_ACL_FIELD_SELECTOR_STRIDE,
++					rtl8372n_acl_field_selectors[index]);
++		if (ret)
++			goto out_unlock;
++
++		ret = rtl837x_reg_read(priv,
++				       RTL8372N_ACL_FIELD_SELECTOR_BASE +
++				       index * RTL8372N_ACL_FIELD_SELECTOR_STRIDE,
++				       &readback);
++		if (ret)
++			goto out_unlock;
++
++		if ((readback & GENMASK(10, 0)) !=
++		    rtl8372n_acl_field_selectors[index]) {
++			ret = -EIO;
++			goto out_unlock;
++		}
++	}
++
++	ret = rtl837x_reg_bits_write(priv, RTL8373_ACL_PORT_EN_ADDR,
++				     RTL8373_ACL_PORT_EN_PMSK_MASK,
++				     user_ports);
++	if (ret)
++		goto out_unlock;
++
++	ret = rtl837x_reg_bits_write(priv, RTL8373_ACL_PORT_UNMATCH_PERMIT_ADDR,
++				     RTL8373_ACL_PORT_UNMATCH_PERMIT_PMSK_ACT_MASK,
++				     user_ports);
++	if (ret)
++		goto out_unlock;
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_ACL_PORT_EN_ADDR,
++				    RTL8373_ACL_PORT_EN_PMSK_MASK,
++				    &readback);
++	if (ret)
++		goto out_unlock;
++
++	if (readback != user_ports) {
++		ret = -EIO;
++		goto out_unlock;
++	}
++
++	ret = rtl837x_reg_bits_read(priv,
++				    RTL8373_ACL_PORT_UNMATCH_PERMIT_ADDR,
++				    RTL8373_ACL_PORT_UNMATCH_PERMIT_PMSK_ACT_MASK,
++				    &readback);
++	if (ret)
++		goto out_unlock;
++
++	if (readback != user_ports) {
++		ret = -EIO;
++		goto out_unlock;
++	}
++
++	memset(chip_data->acl, 0, sizeof(chip_data->acl));
++	bitmap_zero(chip_data->acl_counter_used, RTL8372N_ACL_COUNTERS);
++	chip_data->acl_count = 0;
++	chip_data->acl_hw_count = 0;
++	chip_data->acl_trap_count = 0;
++
++out_unlock:
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int
++rtl8372n_acl_field_set(struct rtl8372n_acl_match *match, unsigned int field,
++		       u16 data, u16 mask, struct netlink_ext_ack *extack)
++{
++	if (field >= RTL8372N_ACL_FIELDS)
++		return -EINVAL;
++
++	if ((match->data[field] ^ data) & match->mask[field] & mask) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "flower keys conflict in an RTL8372N ACL field");
++		return -EOPNOTSUPP;
++	}
++
++	match->data[field] = (match->data[field] & ~mask) | (data & mask);
++	match->mask[field] |= mask;
++
++	return 0;
++}
++
++static int
++rtl8372n_acl_parse_l2(struct flow_rule *rule,
++		      struct rtl8372n_acl_entry *entry,
++		      __be16 protocol, struct netlink_ext_ack *extack)
++{
++	struct flow_dissector *dissector = rule->match.dissector;
++	struct flow_match_basic basic;
++	struct flow_match_eth_addrs eth;
++	struct rtl8372n_acl_match *match = &entry->match;
++	u64 supported_keys;
++	unsigned int i;
++	int ret;
++
++	supported_keys = BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
++			 BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
++			 BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS);
++
++	if (dissector->used_keys & ~supported_keys) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "flower key is not supported by RTL8372N L2 ACL");
++		return -EOPNOTSUPP;
++	}
++
++	if (flow_rule_match_has_control_flags(rule, extack))
++		return -EOPNOTSUPP;
++
++	match->info_data =
++		FIELD_PREP(RTL8372N_ACL_TEMPLATE_MASK,
++			   RTL8372N_ACL_TEMPLATE_L2) |
++		FIELD_PREP(RTL8372N_ACL_ALL_PORT_MASK <<
++			   RTL8372N_ACL_ACTIVE_PORT_SHIFT,
++			   entry->port);
++	match->info_mask =
++		RTL8372N_ACL_TEMPLATE_MASK |
++		(RTL8372N_ACL_ALL_PORT_MASK <<
++		 RTL8372N_ACL_ACTIVE_PORT_SHIFT);
++
++	if (protocol != htons(ETH_P_ALL)) {
++		ret = rtl8372n_acl_field_set(match, 6, be16_to_cpu(protocol),
++					      0xffff, extack);
++		if (ret)
++			return ret;
++	}
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
++		flow_rule_match_basic(rule, &basic);
++
++		if (basic.mask->ip_proto) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "RTL8372N L2 ACL does not match IP protocol yet");
++			return -EOPNOTSUPP;
++		}
++
++		if (basic.mask->n_proto) {
++			ret = rtl8372n_acl_field_set(match, 6,
++					      be16_to_cpu(basic.key->n_proto),
++					      be16_to_cpu(basic.mask->n_proto),
++					      extack);
++			if (ret)
++				return ret;
++		}
++	}
++
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS))
++		return 0;
++
++	flow_rule_match_eth_addrs(rule, &eth);
++
++	for (i = 0; i < ETH_ALEN / 2; i++) {
++		ret = rtl8372n_acl_field_set(match, i,
++				eth.key->dst[5 - i * 2] |
++				(u16)eth.key->dst[4 - i * 2] << 8,
++				eth.mask->dst[5 - i * 2] |
++				(u16)eth.mask->dst[4 - i * 2] << 8,
++				extack);
++		if (ret)
++			return ret;
++
++		ret = rtl8372n_acl_field_set(match, i + 3,
++				eth.key->src[5 - i * 2] |
++				(u16)eth.key->src[4 - i * 2] << 8,
++				eth.mask->src[5 - i * 2] |
++				(u16)eth.mask->src[4 - i * 2] << 8,
++				extack);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int
++rtl8372n_acl_parse_action(struct dsa_switch *ds,
++			  struct flow_rule *rule,
++			  struct rtl8372n_acl_entry *entry,
++			  struct netlink_ext_ack *extack)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	const struct flow_action_entry *act;
++	struct dsa_port *cpu_dp;
++	struct dsa_port *to_dp;
++	u32 fwd_mask = 0;
++	bool forwarding = false;
++	unsigned int index;
++	int ret;
++
++	if (!flow_action_has_entries(&rule->action)) {
++		NL_SET_ERR_MSG_MOD(extack, "RTL8372N ACL requires an action");
++		return -EOPNOTSUPP;
++	}
++
++	act = flow_action_first_entry_get(&rule->action);
++
++	if (act->hw_stats == FLOW_ACTION_HW_STATS_DISABLED) {
++		if (!flow_action_mixed_hw_stats_check(&rule->action, extack))
++			return -EOPNOTSUPP;
++	} else {
++		if (!flow_action_hw_stats_check(&rule->action, extack,
++						FLOW_ACTION_HW_STATS_DELAYED_BIT))
++			return -EOPNOTSUPP;
++
++		entry->stats_enabled = true;
++	}
++
++	flow_action_for_each(index, act, &rule->action) {
++		if (forwarding) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "multiple RTL8372N forwarding actions are unsupported");
++			return -EOPNOTSUPP;
++		}
++
++		switch (act->id) {
++		case FLOW_ACTION_DROP:
++			/*
++			 * RTL8372N encodes drop as a redirect forwarding
++			 * action with an empty destination-port mask.
++			 */
++			forwarding = true;
++			break;
++
++		case FLOW_ACTION_REDIRECT:
++			to_dp = dsa_port_from_netdev(act->dev);
++			if (IS_ERR(to_dp) || to_dp->ds != ds ||
++			    !rtl8372n_port_is_user(ds, to_dp->index)) {
++				NL_SET_ERR_MSG_MOD(extack,
++						   "ACL redirect destination is not an RTL8372N user port");
++				return -EOPNOTSUPP;
++			}
++
++			if (to_dp->index == entry->port) {
++				NL_SET_ERR_MSG_MOD(extack,
++						   "ACL redirect source and destination must differ");
++				return -EINVAL;
++			}
++
++			fwd_mask = BIT(to_dp->index);
++			forwarding = true;
++			break;
++
++		case FLOW_ACTION_TRAP:
++			/*
++			 * The RTL8_4 external CPU tag identifies the ingress
++			 * source port after an ACL redirect to the CPU. DSA
++			 * 802.1Q needs a separate ingress S-VID action and is
++			 * deliberately deferred to a later patch.
++			 */
++			if (priv->tag_proto != DSA_TAG_PROTO_RTL8_4) {
++				NL_SET_ERR_MSG_MOD(extack,
++						   "ACL trap is supported only with RTL8_4 tagging");
++				return -EOPNOTSUPP;
++			}
++
++			ret = rtl8372n_get_cpu_port(ds, &cpu_dp);
++			if (ret)
++				return ret;
++
++			fwd_mask = BIT(cpu_dp->index);
++			entry->trap = true;
++			forwarding = true;
++			break;
++
++		default:
++			NL_SET_ERR_MSG_MOD(extack,
++					   "unsupported RTL8372N ACL action");
++			return -EOPNOTSUPP;
++		}
++	}
++
++	if (!forwarding) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "RTL8372N ACL requires drop, redirect, or trap");
++		return -EOPNOTSUPP;
++	}
++
++	entry->action_ctrl |= RTL8372N_ACL_ACTION_FWD;
++	entry->action[1] |=
++		FIELD_PREP(RTL8372N_ACL_FWD_ACTION_MASK,
++			   RTL8372N_ACL_FWD_REDIRECT) |
++		FIELD_PREP(RTL8372N_ACL_FWD_PORT_MASK, fwd_mask);
++
++	return 0;
++}
++
++static int rtl8372n_acl_find(struct rtl8372n *chip_data, int port,
++			     unsigned long cookie)
++{
++	unsigned int index;
++
++	for (index = 0; index < chip_data->acl_count; index++) {
++		if (chip_data->acl[index].port == port &&
++		    chip_data->acl[index].cookie == cookie)
++			return index;
++	}
++
++	return -ENOENT;
++}
++
++static void rtl8372n_acl_restore_locked(struct dsa_switch *ds)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	int ret;
++
++	ret = rtl8372n_acl_sync_locked(ds);
++	if (ret)
++		dev_err(priv->dev,
++			"failed to restore RTL8372N ACL hardware state: %d\n",
++			ret);
++}
++
++static int
++rtl8372n_cls_flower_add(struct dsa_switch *ds, int port,
++			struct flow_cls_offload *cls, bool ingress)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct netlink_ext_ack *extack = cls->common.extack;
++	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++	struct rtl8372n_acl_entry entry = {};
++	struct rtl8372n_acl_entry old = {};
++	unsigned int position;
++	unsigned int counter;
++	unsigned int new_trap_count;
++	bool counter_allocated = false;
++	bool replacing;
++	bool sync_started = false;
++	int old_position;
++	int ret;
++
++	if (!ingress || cls->common.chain_index) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "RTL8372N ACL supports ingress chain 0 only");
++		return -EOPNOTSUPP;
++	}
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	entry.cookie = cls->cookie;
++	entry.priority = cls->common.prio;
++	entry.port = port;
++
++	ret = rtl8372n_acl_parse_l2(rule, &entry, cls->common.protocol, extack);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_acl_parse_action(ds, rule, &entry, extack);
++	if (ret)
++		return ret;
++
++	mutex_lock(&chip_data->config_lock);
++
++	if (entry.trap && priv->tag_proto != DSA_TAG_PROTO_RTL8_4) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "ACL trap requires RTL8_4 tagging");
++		ret = -EOPNOTSUPP;
++		goto out_unlock;
++	}
++
++	old_position = rtl8372n_acl_find(chip_data, port, cls->cookie);
++	replacing = old_position >= 0;
++
++	if (replacing)
++		old = chip_data->acl[old_position];
++	else if (chip_data->acl_count == RTL8372N_ACL_RULES) {
++		NL_SET_ERR_MSG_MOD(extack, "RTL8372N ACL TCAM is full");
++		ret = -ENOSPC;
++		goto out_unlock;
++	}
++
++	if (entry.stats_enabled) {
++		if (replacing && old.counter_valid) {
++			entry.counter = old.counter;
++			entry.counter_last = old.counter_last;
++			entry.lastused = old.lastused;
++			entry.counter_valid = true;
++		} else {
++			counter = find_first_zero_bit(chip_data->acl_counter_used,
++						      RTL8372N_ACL_COUNTERS);
++			if (counter == RTL8372N_ACL_COUNTERS) {
++				NL_SET_ERR_MSG_MOD(extack,
++						   "RTL8372N ACL hit counters are exhausted");
++				ret = -ENOSPC;
++				goto out_unlock;
++			}
++
++			__set_bit(counter, chip_data->acl_counter_used);
++			counter_allocated = true;
++
++			ret = rtl8372n_acl_counter_reset_locked(priv, counter,
++								 &entry.counter_last);
++			if (ret)
++				goto out_release_counter;
++
++			entry.counter = counter;
++			entry.counter_valid = true;
++		}
++
++		entry.action_ctrl |= RTL8372N_ACL_ACTION_POLIC_LOG;
++		entry.action[1] |=
++			FIELD_PREP(RTL8372N_ACL_COUNTER_INDEX_MASK,
++				   entry.counter) |
++			RTL8372N_ACL_LOG_SELECT;
++	}
++
++	new_trap_count = chip_data->acl_trap_count;
++	if (replacing && old.trap)
++		new_trap_count--;
++	if (entry.trap)
++		new_trap_count++;
++
++	if (replacing) {
++		chip_data->acl_count--;
++		memmove(&chip_data->acl[old_position],
++			&chip_data->acl[old_position + 1],
++			(chip_data->acl_count - old_position) *
++			sizeof(chip_data->acl[0]));
++	}
++
++	for (position = 0; position < chip_data->acl_count; position++) {
++		if (entry.priority < chip_data->acl[position].priority)
++			break;
++	}
++
++	memmove(&chip_data->acl[position + 1],
++		&chip_data->acl[position],
++		(chip_data->acl_count - position) *
++		sizeof(chip_data->acl[0]));
++	chip_data->acl[position] = entry;
++	chip_data->acl_count++;
++
++	sync_started = true;
++	ret = rtl8372n_acl_sync_range_locked(ds,
++				replacing ? min(old_position, position) : position);
++	if (ret)
++		goto out_restore;
++
++	chip_data->acl_trap_count = new_trap_count;
++
++	if (replacing && old.counter_valid &&
++	    (!entry.counter_valid || old.counter != entry.counter))
++		__clear_bit(old.counter, chip_data->acl_counter_used);
++
++	goto out_unlock;
++
++out_restore:
++	chip_data->acl_count--;
++	memmove(&chip_data->acl[position],
++		&chip_data->acl[position + 1],
++		(chip_data->acl_count - position) *
++		sizeof(chip_data->acl[0]));
++
++	if (replacing) {
++		memmove(&chip_data->acl[old_position + 1],
++			&chip_data->acl[old_position],
++			(chip_data->acl_count - old_position) *
++			sizeof(chip_data->acl[0]));
++		chip_data->acl[old_position] = old;
++		chip_data->acl_count++;
++	}
++
++	if (sync_started)
++		rtl8372n_acl_restore_locked(ds);
++
++out_release_counter:
++	if (counter_allocated)
++		__clear_bit(entry.counter, chip_data->acl_counter_used);
++
++out_unlock:
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int
++rtl8372n_cls_flower_del(struct dsa_switch *ds, int port,
++			struct flow_cls_offload *cls, bool ingress)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct rtl8372n_acl_entry old;
++	int position;
++	int ret;
++
++	if (!ingress)
++		return -EOPNOTSUPP;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&chip_data->config_lock);
++
++	position = rtl8372n_acl_find(chip_data, port, cls->cookie);
++	if (position < 0) {
++		ret = position;
++		goto out_unlock;
++	}
++
++	old = chip_data->acl[position];
++	chip_data->acl_count--;
++	memmove(&chip_data->acl[position],
++		&chip_data->acl[position + 1],
++		(chip_data->acl_count - position) *
++		sizeof(chip_data->acl[0]));
++
++	ret = rtl8372n_acl_sync_range_locked(ds, position);
++	if (ret) {
++		memmove(&chip_data->acl[position + 1],
++			&chip_data->acl[position],
++			(chip_data->acl_count - position) *
++			sizeof(chip_data->acl[0]));
++		chip_data->acl[position] = old;
++		chip_data->acl_count++;
++		rtl8372n_acl_restore_locked(ds);
++		goto out_unlock;
++	}
++
++	if (old.counter_valid)
++		__clear_bit(old.counter, chip_data->acl_counter_used);
++
++	if (old.trap)
++		chip_data->acl_trap_count--;
++
++out_unlock:
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
++static int
++rtl8372n_cls_flower_stats(struct dsa_switch *ds, int port,
++			  struct flow_cls_offload *cls, bool ingress)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct rtl8372n_acl_entry *entry;
++	unsigned long lastused;
++	u32 packets;
++	u32 delta;
++	int position;
++	int ret = 0;
++
++	if (!ingress)
++		return -EOPNOTSUPP;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&chip_data->config_lock);
++
++	position = rtl8372n_acl_find(chip_data, port, cls->cookie);
++	if (position < 0) {
++		ret = position;
++		goto out_unlock;
++	}
++
++	entry = &chip_data->acl[position];
++	if (!entry->counter_valid)
++		goto out_unlock;
++
++	ret = rtl8372n_acl_counter_read_locked(priv, entry->counter, &packets);
++	if (ret)
++		goto out_unlock;
++
++	delta = packets - entry->counter_last;
++	if (delta)
++	entry->lastused = jiffies;
++
++	entry->counter_last = packets;
++	lastused = entry->lastused;
++
++	/*
++	 * RTL8372N ACL log counters expose packet hits only. Report zero
++	 * bytes rather than fabricating byte statistics.
++	 */
++	flow_stats_update(&cls->stats, 0, delta, 0, lastused,
++			  FLOW_ACTION_HW_STATS_DELAYED);
++
++out_unlock:
++	mutex_unlock(&chip_data->config_lock);
++
++	return ret;
++}
++
+ enum RTL8373_MSTP_STATE
+ {
+     MSTP_DISABLE = 0,
+@@ -4764,6 +5833,10 @@ static int rtl8372n_setup(struct dsa_swi
+ 	if (ret)
+ 		return ret;
+ 
++	ret = rtl8372n_acl_hw_init(ds);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Warning! 
+ 	 * The following understanding may be incorrect
+@@ -4988,6 +6061,9 @@ static const struct dsa_switch_ops rtl83
+ 	.port_del_dscp_prio = rtl8372n_port_del_dscp_prio,
+ 	.port_set_apptrust = rtl8372n_port_set_apptrust,
+ 	.port_get_apptrust = rtl8372n_port_get_apptrust,
++	.cls_flower_add = rtl8372n_cls_flower_add,
++	.cls_flower_del = rtl8372n_cls_flower_del,
++	.cls_flower_stats = rtl8372n_cls_flower_stats,
+ 
+ 	.tag_8021q_vlan_add = rtl8372n_tag_8021q_vlan_add,
+ 	.tag_8021q_vlan_del = rtl8372n_tag_8021q_vlan_del,
+--- a/src/rtl837x.h
++++ b/src/rtl837x.h
+@@ -92,6 +92,7 @@ struct rtl837x_priv {
+  	struct mii_bus *bus;
+ 	struct regmap		*map;
+ 	struct mutex		map_lock;
++	struct mutex		ita_lock;
+ 	struct regmap		*map_8224;
+ 	struct mutex		map_8224_lock;
+ 	int			mdio_addr;
+--- a/src/rtl837x_mdio.c
++++ b/src/rtl837x_mdio.c
+@@ -181,6 +181,7 @@ static int rtl837x_mdio_probe(struct mdi
+ 	}
+ 
+ 	mutex_init(&priv->map_lock);
++	mutex_init(&priv->ita_lock);
+ 	
+ 	rc = rtl837x_mdio_regmap_config;
+ 	rc.lock_arg = priv;
