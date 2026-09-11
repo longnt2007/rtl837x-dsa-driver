@@ -1,0 +1,300 @@
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -256,6 +256,12 @@ struct rtl8372n {
+ 	 * not completed successfully yet.
+ 	 */
+ 	int cpu_port;
++
++	/* Port mirror */
++	u16 mirror_rx_mask;
++	u16 mirror_tx_mask;
++	u8 mirror_port;
++	bool mirror_port_valid;
+ };
+ 
+ /*
+@@ -1254,6 +1260,275 @@ static int rtl8372n_change_tag_protocol(
+ 	return 0;
+ }
+ 
++/*
++ * regmap_update_bits() expects val to already be aligned to mask, unlike
++ * rtl837x_reg_bits_write(), which shifts an unaligned value into mask.
++ */
++static int rtl8372n_mirror_update_bits(struct rtl837x_priv *priv, u32 reg,
++				       u32 mask, u32 val)
++{
++	return regmap_update_bits(priv->map, reg, mask, val & mask);
++}
++
++/*
++ * Program the single RTL8372N mirror engine.
++ *
++ * Callers must hold chip_data->config_lock. This function does not update
++ * software state; callers do so only after the complete hardware transaction
++ * and readback have succeeded.
++ */
++static int rtl8372n_mirror_program(struct dsa_switch *ds, int monitor_port,
++				   u16 rx_mask, u16 tx_mask)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	const u32 ctrl_mask =
++		RTL8373_MIR_SET_CTRL_MIR_ISO_MASK |
++		RTL8373_MIR_SET_CTRL_MIR_RX_TX_SEL_MASK |
++		RTL8373_MIR_SET_CTRL_MTP_PORT_MASK |
++		RTL8373_MIR_SET_CTRL_MIR_EN_MASK;
++	const u32 policy_mask =
++		RTL8373_MIR_CTRL_MIR_REALKEEP_EN_MASK |
++		RTL8373_MIR_CTRL_MIR_RX_ISOLATE_LKY_MASK |
++		RTL8373_MIR_CTRL_MIR_TX_ISOLATE_LKY_MASK |
++		RTL8373_MIR_CTRL_MIR_RX_VLAN_LKY_MASK |
++		RTL8373_MIR_CTRL_MIR_TX_VLAN_LKY_MASK;
++	const u32 port_mask =
++		RTL8373_MIR_SET_PMSK_RX_PMSK_MASK |
++		RTL8373_MIR_SET_PMSK_TX_PMSK_MASK;
++	bool enable = rx_mask || tx_mask;
++	u32 ctrl = 0;
++	u32 policy = 0;
++	u32 sources;
++	u32 readback;
++	int ret;
++
++	if (enable && !rtl8372n_port_is_user(ds, monitor_port))
++		return -EINVAL;
++
++	rx_mask &= RTL8372N_VLAN_MEMBER_MASK;
++	tx_mask &= RTL8372N_VLAN_MEMBER_MASK;
++
++	sources = FIELD_PREP(RTL8373_MIR_SET_PMSK_RX_PMSK_MASK, rx_mask) |
++		  FIELD_PREP(RTL8373_MIR_SET_PMSK_TX_PMSK_MASK, tx_mask);
++
++	if (enable) {
++		ctrl = FIELD_PREP(RTL8373_MIR_SET_CTRL_MTP_PORT_MASK,
++				  monitor_port) |
++		       RTL8373_MIR_SET_CTRL_MIR_EN_MASK;
++
++		/*
++		 * The RTL8372N mirror control selects RX when only RX
++		 * sources are enabled. With TX-only or bidirectional
++		 * mirroring, retain the hardware's normal TX/both handling.
++		 */
++		if (rx_mask && !tx_mask)
++			ctrl |= RTL8373_MIR_SET_CTRL_MIR_RX_TX_SEL_MASK;
++
++		policy = RTL8373_MIR_CTRL_MIR_REALKEEP_EN_MASK;
++
++		if (rx_mask)
++			policy |= RTL8373_MIR_CTRL_MIR_RX_ISOLATE_LKY_MASK |
++				  RTL8373_MIR_CTRL_MIR_RX_VLAN_LKY_MASK;
++
++		if (tx_mask)
++			policy |= RTL8373_MIR_CTRL_MIR_TX_ISOLATE_LKY_MASK |
++				  RTL8373_MIR_CTRL_MIR_TX_VLAN_LKY_MASK;
++	} else {
++		/*
++		 * Stop the engine before clearing source masks and policy.
++		 * This prevents a stale monitor-port selection from receiving
++		 * traffic while the transaction is being torn down.
++		 */
++		ret = rtl8372n_mirror_update_bits(priv,
++						  RTL8373_MIR_SET_CTRL_ADDR,
++						  ctrl_mask, 0);
++		if (ret)
++			return ret;
++	}
++
++	ret = rtl8372n_mirror_update_bits(priv, RTL8373_MIR_SET_PMSK_ADDR,
++					  port_mask, sources);
++	if (ret)
++		return ret;
++
++	ret = rtl8372n_mirror_update_bits(priv, RTL8373_MIR_CTRL_ADDR,
++					  policy_mask, policy);
++	if (ret)
++		return ret;
++
++	if (enable) {
++		ret = rtl8372n_mirror_update_bits(priv,
++						  RTL8373_MIR_SET_CTRL_ADDR,
++						  ctrl_mask, ctrl);
++		if (ret)
++			return ret;
++	}
++
++	ret = rtl837x_reg_read(priv, RTL8373_MIR_SET_PMSK_ADDR, &readback);
++	if (ret)
++		return ret;
++
++	if ((readback & port_mask) != sources)
++		return -EIO;
++
++	ret = rtl837x_reg_read(priv, RTL8373_MIR_CTRL_ADDR, &readback);
++	if (ret)
++		return ret;
++
++	if ((readback & policy_mask) != policy)
++		return -EIO;
++
++	ret = rtl837x_reg_read(priv, RTL8373_MIR_SET_CTRL_ADDR, &readback);
++	if (ret)
++		return ret;
++
++	if ((readback & ctrl_mask) != ctrl)
++		return -EIO;
++
++	return 0;
++}
++
++static int
++rtl8372n_port_mirror_add(struct dsa_switch *ds, int port,
++			  struct dsa_mall_mirror_tc_entry *mirror,
++			  bool ingress, struct netlink_ext_ack *extack)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	int monitor_port = mirror->to_local_port;
++	int restore_ret;
++	int ret;
++
++	mutex_lock(&chip_data->config_lock);
++	u16 old_rx = chip_data->mirror_rx_mask;
++	u16 old_tx = chip_data->mirror_tx_mask;
++	u16 new_rx = old_rx;
++	u16 new_tx = old_tx;
++	int old_monitor = chip_data->mirror_port_valid ?
++			  chip_data->mirror_port : 0;
++
++	if (!rtl8372n_port_is_user(ds, port) ||
++	    !rtl8372n_port_is_user(ds, monitor_port)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "RTL8372N mirroring only supports DSA user ports");
++		ret = -EOPNOTSUPP;
++		goto out_unlock;
++	}
++
++	if (port == monitor_port) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "mirror source and monitor port must differ");
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	if (chip_data->mirror_port_valid &&
++	    chip_data->mirror_port != monitor_port) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "RTL8372N supports only one monitor port");
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
++	if ((ingress ? old_rx : old_tx) & BIT(port)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "mirror source is already offloaded");
++		ret = -EEXIST;
++		goto out_unlock;
++	}
++
++	if (ingress)
++		new_rx |= BIT(port);
++	else
++		new_tx |= BIT(port);
++
++	ret = rtl8372n_mirror_program(ds, monitor_port, new_rx, new_tx);
++	if (ret) {
++		restore_ret = rtl8372n_mirror_program(ds, old_monitor,
++						      old_rx, old_tx);
++		if (restore_ret)
++			dev_err(ds->dev,
++				"failed to restore mirror state after add error: %d\n",
++				restore_ret);
++
++		dev_err(ds->dev, "mirror add failed for port %d: %d\n",
++			port, ret);
++		goto out_unlock;
++	}
++
++	chip_data->mirror_rx_mask = new_rx;
++	chip_data->mirror_tx_mask = new_tx;
++	chip_data->mirror_port = monitor_port;
++	chip_data->mirror_port_valid = true;
++
++out_unlock:
++	mutex_unlock(&chip_data->config_lock);
++	return ret;
++}
++
++static void
++rtl8372n_port_mirror_del(struct dsa_switch *ds, int port,
++			  struct dsa_mall_mirror_tc_entry *mirror)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	int monitor_port;
++	int restore_ret;
++	int ret;
++
++	mutex_lock(&chip_data->config_lock);
++	u16 old_rx = chip_data->mirror_rx_mask;
++	u16 old_tx = chip_data->mirror_tx_mask;
++	u16 new_rx = old_rx;
++	u16 new_tx = old_tx;
++
++	if (!rtl8372n_port_is_user(ds, port))
++		goto out_unlock;
++
++	if (!chip_data->mirror_port_valid ||
++	    chip_data->mirror_port != mirror->to_local_port)
++		goto out_unlock;
++
++	if (mirror->ingress) {
++		if (!(new_rx & BIT(port)))
++			goto out_unlock;
++
++		new_rx &= ~BIT(port);
++	} else {
++		if (!(new_tx & BIT(port)))
++			goto out_unlock;
++
++		new_tx &= ~BIT(port);
++	}
++
++	monitor_port = (new_rx || new_tx) ? chip_data->mirror_port : 0;
++
++	ret = rtl8372n_mirror_program(ds, monitor_port, new_rx, new_tx);
++	if (ret) {
++		restore_ret = rtl8372n_mirror_program(ds,
++						      chip_data->mirror_port,
++						      old_rx, old_tx);
++		if (restore_ret)
++			dev_err(ds->dev,
++				"failed to restore mirror state after delete error: %d\n",
++				restore_ret);
++
++		dev_err(ds->dev, "mirror delete failed for port %d: %d\n",
++			port, ret);
++		goto out_unlock;
++	}
++
++	chip_data->mirror_rx_mask = new_rx;
++	chip_data->mirror_tx_mask = new_tx;
++
++	if (!new_rx && !new_tx) {
++		chip_data->mirror_port = 0;
++		chip_data->mirror_port_valid = false;
++	}
++out_unlock:
++	mutex_unlock(&chip_data->config_lock);
++}
++
+ static int rtl8372n_port_set_isolation(struct rtl837x_priv *priv, int port,
+ 					u32 mask)
+ {
+@@ -2530,6 +2805,8 @@ static const struct dsa_switch_ops rtl83
+ 	.port_mdb_add  = rtl8372n_port_mdb_add,
+ 	.port_mdb_del  = rtl8372n_port_mdb_del,
+     .port_fast_age = rtl8372n_port_fast_age,
++	.port_mirror_add = rtl8372n_port_mirror_add,
++	.port_mirror_del = rtl8372n_port_mirror_del,
+ 
+ 	.tag_8021q_vlan_add = rtl8372n_tag_8021q_vlan_add,
+ 	.tag_8021q_vlan_del = rtl8372n_tag_8021q_vlan_del,

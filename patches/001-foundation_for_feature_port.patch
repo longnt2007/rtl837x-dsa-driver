@@ -1,0 +1,236 @@
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -1,6 +1,7 @@
+ #include <linux/version.h>
+ #include <linux/regmap.h>
+ #include <linux/if_bridge.h>
++#include <linux/mutex.h>
+ 
+ #include "rtl837x.h"
+ 
+@@ -234,15 +235,89 @@ struct rtl8372n {
+ 	netdev_features_t csum_feature_backup;
+ 	bool pvid_enabled[RTL8372N_NUM_PORTS];
+ 	bool dsa_tag_8021q_vid[RTL8372N_VLAN_MAX+1];
++
++	/*
++	 * Serializes advanced feature transactions which program more than
++	 * one RTL8372N register. This lock must remain separate from the
++	 * regmap lock: config_lock protects feature state and transaction
++	 * boundaries, while priv->map_lock serializes individual regmap I/O.
++	 *
++	 * Lock ordering for future feature code:
++	 *
++	 *   config_lock -> regmap/map_lock -> MDIO bus lock
++	 *
++	 * Do not take config_lock from regmap callbacks.
++	 */
++	struct mutex config_lock;
++
++	/*
++	 * Set by rtl8372n_setup() only after DSA has validated that exactly
++	 * one CPU port exists. A negative value means the switch setup has
++	 * not completed successfully yet.
++	 */
++	int cpu_port;
+ };
+ 
++/*
++ * Port roles are defined by DSA/Device Tree, not by a numerical range.
++ *
++ * In the MT7988 topology this accepts ports 4..8 when they are declared
++ * as DSA user ports, including SFP port 8, while rejecting CPU port 3.
++ * Future mirror, LAG, QoS, ACL and PTP callbacks must use this helper
++ * instead of open-coding a port range.
++ */
++static bool rtl8372n_port_is_user(struct dsa_switch *ds, int port)
++{
++	if (port < 0 || port >= ds->num_ports)
++		return false;
++
++	return dsa_is_user_port(ds, port);
++}
++
++/*
++ * Return the CPU port whose index was validated by rtl8372n_setup().
++ * This deliberately does not return the first CPU port encountered:
++ * doing so would hide a topology/setup mismatch from future advanced
++ * feature code.
++ */
++static int rtl8372n_get_cpu_port(struct dsa_switch *ds,
++				  struct dsa_port **cpu_dp)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct dsa_port *dp;
++
++	*cpu_dp = NULL;
++
++	if (chip_data->cpu_port < 0)
++		return -EAGAIN;
++
++	dsa_switch_for_each_cpu_port(dp, ds) {
++		if (dp->index != chip_data->cpu_port)
++			continue;
++
++		*cpu_dp = dp;
++		return 0;
++	}
++
++	return -ENODEV;
++}
++
+ static int rtl8372n_detect(struct rtl837x_priv *priv)
+ {
+ 	struct device *dev = priv->dev;
++	struct rtl8372n *chip_data = priv->chip_data;
+ 	int ret;
+ 	u32 val;
+ 
+     switch_chip_t sw_chip;
++	/*
++	 * setup() is serialized by DSA before runtime switch operations.
++	 * Reset the topology state so a failed setup cannot leave a stale
++	 * CPU-port index behind.
++	 */
++	mutex_init(&chip_data->config_lock);
++	chip_data->cpu_port = -1;
+ 
+ 	ret = rtl837x_reg_read(priv, RTL8373_MODEL_NAME_INFO_ADDR, &val);
+     dev_info(dev, "CHIP_ID: 0x%08x \n", val);
+@@ -808,18 +883,14 @@ static int rtl8372n_set_tag_rtl(struct d
+ 	int ret;
+     struct rtl837x_priv *priv = ds->priv;
+ 	struct rtl8372n *chip_data = priv->chip_data;
+-	struct dsa_port *dp, *cpu_dp = NULL;
++	struct dsa_port *cpu_dp;
+ 	struct net_device *master_dev = NULL;
+ 	dev_dbg(priv->dev, "[%s]\n", __func__);
+ 
+ 	// Only support one CPU port
+-	dsa_switch_for_each_cpu_port(dp, ds) {
+-		cpu_dp = dp;
+-		break;
+-	}
+-
+-	if (cpu_dp == NULL)
+-		return -ENODEV;
++	ret = rtl8372n_get_cpu_port(ds, &cpu_dp);
++	if (ret)
++		return ret;
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6,12,44)
+ 	master_dev = cpu_dp->master;
+@@ -872,18 +943,15 @@ static int rtl8372n_teardown_tag_rtl(str
+ {
+     struct rtl837x_priv *priv = ds->priv;
+ 	struct rtl8372n *chip_data = priv->chip_data;
+-	struct dsa_port *dp, *cpu_dp = NULL;
++	struct dsa_port *cpu_dp;
+ 	struct net_device *master_dev = NULL;
++	int ret;
+ 	dev_dbg(priv->dev, "[%s]\n", __func__);
+ 
+ 	// Only support one CPU port
+-	dsa_switch_for_each_cpu_port(dp, ds) {
+-		cpu_dp = dp;
+-		break;
+-	}
+-
+-	if (cpu_dp == NULL)
+-		return -ENODEV;
++	ret = rtl8372n_get_cpu_port(ds, &cpu_dp);
++	if (ret)
++		return ret;
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6,12,44)
+ 	master_dev = cpu_dp->master;
+@@ -914,9 +982,8 @@ static int rtl8372n_teardown_tag_rtl(str
+ 			);
+ 
+ 	// Remove cpu port from RTL8_4 TAG aware port
+-	dsa_switch_for_each_cpu_port(dp, ds) {
+-		rtl837x_reg_bits_write(priv, RTL8373_CPU_TAG_AWARE_CTRL_ADDR, BIT(dp->index), 0);
+-	}
++	rtl837x_reg_bits_write(priv, RTL8373_CPU_TAG_AWARE_CTRL_ADDR,
++			       BIT(cpu_dp->index), 0);
+ 
+     master_dev->wanted_features |= chip_data->csum_feature_backup;
+     netdev_update_features(master_dev);
+@@ -932,14 +999,16 @@ static int rtl8372n_set_tag_8021q(struct
+ {
+ 	int ret;
+     struct rtl837x_priv *priv = ds->priv;
+-	struct dsa_port *dp = NULL;
++	struct dsa_port *cpu_dp;
+ 	dev_dbg(priv->dev, "[%s]\n", __func__);
+ 
+ 	u32 cpu_port_mask = 0;
+ 
+-	dsa_switch_for_each_cpu_port(dp, ds) {
+-		cpu_port_mask |= BIT(dp->index);
+-	}
++	ret = rtl8372n_get_cpu_port(ds, &cpu_dp);
++	if (ret)
++		return ret;
++
++	cpu_port_mask = BIT(cpu_dp->index);
+ 
+ 	//  bit0: internal cpu; bit1: external cpu
+ 	ret = rtl837x_reg_bits_write(priv, RTL8373_SVLAN_TRAP_CTRL_ADDR,
+@@ -1077,7 +1146,7 @@ static int rtl8372n_tag_8021q_vlan_add(s
+ 
+ 	u32 member = 0, untag = 0;
+ 	member |= BIT(port);
+-	if (dsa_is_user_port(ds, port))
++	if (rtl8372n_port_is_user(ds, port))
+ 	{
+ 		untag |= BIT(port);
+ 	}
+@@ -1133,7 +1202,7 @@ static int rtl8372n_tag_8021q_vlan_del(s
+ 	chip_data->dsa_tag_8021q_vid[vid] = false;
+ 
+ 	// Clean Port SVID
+-	if (dsa_is_user_port(ds, port))
++	if (rtl8372n_port_is_user(ds, port))
+ 		ret = rtl837x_reg_bits_write(priv, RTL8373_VS_PORT_DFLT_SVID_ADDR(port), 
+ 				  RTL8373_VS_PORT_DFLT_SVID_PORT_DFLT_SVID_MASK(port), 0
+ 				);
+@@ -1152,9 +1221,11 @@ static int rtl8372n_change_tag_protocol(
+ {
+ 	int ret;
+     struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
+ 
+ 	dev_dbg(priv->dev, "[%s]: proto: %d\n", __func__, proto);
+ 
++	mutex_lock(&chip_data->config_lock);
+ 
+ 	switch (proto) {
+ 	case DSA_TAG_PROTO_MXL862_8021Q:
+@@ -1178,6 +1249,8 @@ static int rtl8372n_change_tag_protocol(
+ 	}
+ 	priv->tag_proto = proto;
+ 
++	mutex_unlock(&chip_data->config_lock);
++
+ 	return 0;
+ }
+ 
+@@ -2000,6 +2073,7 @@ static int rtl8372n_setup(struct dsa_swi
+ 		return -ENODEV;
+ 	}
+ 
++	chip_data->cpu_port = cpu_dp->index;
+ 	chip_data->pcs[3].pcs.ops = &rtl8372n_sds_pcs_ops;
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
+ 	chip_data->pcs[3].pcs.neg_mode = true;
+@@ -2219,7 +2293,7 @@ static int rtl8372n_setup(struct dsa_swi
+ 		if (ret)
+ 			return ret;
+ 
+-		if (!dsa_port_is_user(dp))
++		if (!rtl8372n_port_is_user(ds, port))
+ 			continue;
+ 
+ 		ret = rtl8372n_port_add_cpu_vlan_transparent(priv, port);
