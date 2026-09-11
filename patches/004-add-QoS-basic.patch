@@ -1,5 +1,3 @@
-diff --git a/src/rtl8372n.c b/src/rtl8372n.c
-index 4eaa8dc..24e3ae8 100644
 --- a/src/rtl8372n.c
 +++ b/src/rtl8372n.c
 @@ -3,6 +3,10 @@
@@ -50,7 +48,7 @@ index 4eaa8dc..24e3ae8 100644
  };
  
  /*
-@@ -2870,6 +2897,842 @@ static int rtl8372n_lag_fdb_del(struct dsa_switch *ds, struct dsa_lag lag,
+@@ -2870,6 +2897,842 @@ static int rtl8372n_lag_fdb_del(struct d
  	return ret;
  }
  
@@ -893,7 +891,7 @@ index 4eaa8dc..24e3ae8 100644
  enum RTL8373_MSTP_STATE
  {
      MSTP_DISABLE = 0,
-@@ -3205,6 +4068,10 @@ static int rtl8372n_setup(struct dsa_switch *ds)
+@@ -3205,6 +4068,10 @@ static int rtl8372n_setup(struct dsa_swi
  	ret = rtl8372n_set_vlan_4k(priv, &def_vlan);
  	if (ret)
  		return ret;
@@ -904,7 +902,7 @@ index 4eaa8dc..24e3ae8 100644
  
  	/*
  	 * Warning! 
-@@ -3419,6 +4286,15 @@ static const struct dsa_switch_ops rtl8372n_switch_ops_mdio = {
+@@ -3419,6 +4286,15 @@ static const struct dsa_switch_ops rtl83
  	.port_lag_change = rtl8372n_port_lag_change,
  	.lag_fdb_add     = rtl8372n_lag_fdb_add,
  	.lag_fdb_del     = rtl8372n_lag_fdb_del,
@@ -920,15 +918,13 @@ index 4eaa8dc..24e3ae8 100644
  
  	.tag_8021q_vlan_add = rtl8372n_tag_8021q_vlan_add,
  	.tag_8021q_vlan_del = rtl8372n_tag_8021q_vlan_del,
-@@ -3447,5 +4323,6 @@ const struct rtl837x_variant rtl8372n_variant = {
+@@ -3447,5 +4323,6 @@ const struct rtl837x_variant rtl8372n_va
  	.num_lag_ids = RTL8372N_TRUNK_GROUPS,
  	.have_8224 = false,
  	.chip_data_sz = sizeof(struct rtl8372n),
 +	.dscp_prio_mapping_is_global = true,
  };
  EXPORT_SYMBOL_GPL(rtl8372n_variant);
-diff --git a/src/rtl837x.h b/src/rtl837x.h
-index 02489b0..928b6ca 100644
 --- a/src/rtl837x.h
 +++ b/src/rtl837x.h
 @@ -210,6 +210,7 @@ struct rtl837x_variant {
@@ -939,11 +935,9 @@ index 02489b0..928b6ca 100644
  };
  
  struct rtl837x_ops {
-diff --git a/src/rtl837x_mdio.c b/src/rtl837x_mdio.c
-index b95272c..d7b86df 100644
 --- a/src/rtl837x_mdio.c
 +++ b/src/rtl837x_mdio.c
-@@ -281,6 +281,7 @@ static int rtl837x_mdio_probe(struct mdio_device *mdiodev)
+@@ -281,6 +281,7 @@ static int rtl837x_mdio_probe(struct mdi
  	priv->ds->priv = priv;
  	priv->ds->ops = var->ds_ops_mdio;
  	priv->ds->num_lag_ids = var->num_lag_ids;

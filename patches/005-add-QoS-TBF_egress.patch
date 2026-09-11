@@ -1,0 +1,418 @@
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -43,6 +43,12 @@
+ #define RTL8372N_QOS_WEIGHT_ACL			2
+ #define RTL8372N_QOS_WEIGHT_PORT		1
+ 
++#define RTL8372N_QOS_EGBW_ENABLE		BIT(20)
++#define RTL8372N_QOS_EGBW_RATE_MASK		GENMASK(19, 0)
++#define RTL8372N_QOS_EGBW_RATE_UNIT_KBPS	16
++#define RTL8372N_QOS_EGBW_RATE_MAX		FIELD_MAX(RTL8372N_QOS_EGBW_RATE_MASK)
++#define RTL8372N_QOS_EGBW_BURST_MASK	GENMASK(15, 0)
++
+ // TODO: this should check port is serdes mode or port mode
+ #define IS_SERDES_PORT(port) (((port)==3)||((port)==8))
+ 
+@@ -304,6 +310,8 @@ struct rtl8372n {
+ 	u8 qos_profile_sources[RTL8372N_QOS_PROFILES];
+ 	u8 qos_port_profile[RTL8372N_NUM_PORTS];
+ 	u32 qos_ets_handle[RTL8372N_NUM_PORTS];
++	u32 qos_tbf_root_handle[RTL8372N_NUM_PORTS];
++	u32 qos_tbf_queue_handle[RTL8372N_NUM_PORTS][RTL8372N_QOS_QUEUES];
+ };
+ 
+ /*
+@@ -3229,6 +3237,15 @@ static int rtl8372n_qos_hw_init(struct d
+ 			ret = rtl8372n_qos_port_reset_locked(priv, dp->index);
+ 	}
+ 
++	/*
++	 * Linux tc rate accounting is byte based and does not include the
++	 * Ethernet preamble or inter-frame gap. Keep the RTL8372N egress
++	 * bandwidth policer aligned with that accounting model.
++	 */
++	if (!ret)
++		ret = rtl8372n_qos_bits_write_verify(priv, RTL8373_EGBW_CTRL_ADDR,
++						     RTL8373_EGBW_CTRL_INC_IFG_MASK, 0);
++
+ 	if (!ret) {
+ 		memset(chip_data->qos_profile_ports, 0,
+ 		       sizeof(chip_data->qos_profile_ports));
+@@ -3238,6 +3255,10 @@ static int rtl8372n_qos_hw_init(struct d
+ 		       sizeof(chip_data->qos_port_profile));
+ 		memset(chip_data->qos_ets_handle, 0,
+ 		       sizeof(chip_data->qos_ets_handle));
++		memset(chip_data->qos_tbf_root_handle, 0,
++		       sizeof(chip_data->qos_tbf_root_handle));
++		memset(chip_data->qos_tbf_queue_handle, 0,
++		       sizeof(chip_data->qos_tbf_queue_handle));
+ 
+ 		chip_data->qos_profile_ports[0] = user_mask;
+ 		chip_data->qos_profile_sources[0] =
+@@ -3424,6 +3445,12 @@ static int rtl8372n_qos_ets_destroy_lock
+ 	struct rtl8372n *chip_data = priv->chip_data;
+ 	struct rtl8372n_qos_port_state old_state;
+ 	int ret;
++	int queue;
++
++	for (queue = 0; queue < RTL8372N_QOS_QUEUES; queue++) {
++		if (chip_data->qos_tbf_queue_handle[port][queue])
++			return -EBUSY;
++	}
+ 
+ 	ret = rtl8372n_qos_port_state_read_locked(priv, port, &old_state);
+ 	if (ret)
+@@ -3458,6 +3485,343 @@ static int rtl8372n_qos_ets_locked(struc
+ 	}
+ }
+ 
++struct rtl8372n_qos_egbw_location {
++	u32 ctrl_reg;
++	u32 reset_reg;
++	u32 reset_mask;
++	unsigned int queue;
++	bool root;
++};
++
++static int
++rtl8372n_qos_tbf_queue_locked(struct rtl8372n *chip_data, int port,
++			      u32 parent, unsigned int *queue)
++{
++	u32 ets_handle = chip_data->qos_ets_handle[port];
++	u32 band;
++
++	/*
++	 * ETS child qdiscs have parent handles of the form <ets-major>:<band>.
++	 * Linux band 1 maps to RTL8372N hardware queue 7, while band 8 maps
++	 * to queue 0, matching rtl8372n_qos_ets_replace_locked().
++	 */
++	if (!ets_handle || TC_H_MAJ(parent) != TC_H_MAJ(ets_handle))
++		return -EOPNOTSUPP;
++
++	band = TC_H_MIN(parent);
++	if (!band || band > RTL8372N_QOS_QUEUES)
++		return -EOPNOTSUPP;
++
++	*queue = RTL8372N_QOS_QUEUES - band;
++
++	return 0;
++}
++
++static int
++rtl8372n_qos_tbf_location_locked(struct rtl8372n *chip_data, int port,
++				 u32 parent,
++				 struct rtl8372n_qos_egbw_location *location)
++{
++	unsigned int queue;
++	int ret;
++
++	memset(location, 0, sizeof(*location));
++
++	if (parent == TC_H_ROOT) {
++		location->ctrl_reg = RTL8373_EGBW_PORT_CTRL_ADDR(port);
++		location->reset_reg = RTL8373_EGBW_PORT_LB_RST_ADDR(port);
++		location->reset_mask = RTL8373_EGBW_PORT_LB_RST_RST_MASK(port);
++		location->root = true;
++		return 0;
++	}
++
++	ret = rtl8372n_qos_tbf_queue_locked(chip_data, port, parent, &queue);
++	if (ret)
++		return ret;
++
++	location->ctrl_reg =
++		RTL8373_EGBW_PORT_Q_MAX_LB_CTRL_SET_ADDR(port, queue);
++	location->reset_reg =
++		RTL8373_EGBW_PORT_Q_MAX_LB_RST_SET_ADDR(port, queue);
++	location->reset_mask =
++		RTL8373_EGBW_PORT_Q_MAX_LB_RST_SET_RST_MASK(queue);
++	location->queue = queue;
++
++	return 0;
++}
++
++/*
++ * The reset bit is self-cleared by software, not by hardware. Always make
++ * the clear attempt even if the assertion or assertion-readback fails, so a
++ * partial MDIO transaction cannot leave rate limiting in reset state.
++ *
++ * Caller must hold chip_data->config_lock.
++ */
++static int
++rtl8372n_qos_egbw_reset_locked(struct rtl837x_priv *priv, u32 reset_reg,
++			       u32 reset_mask)
++{
++	u32 readback;
++	int ret;
++	int clear_ret;
++
++	ret = rtl837x_reg_bits_write(priv, reset_reg, reset_mask, 1);
++	if (!ret) {
++		ret = rtl837x_reg_bits_read(priv, reset_reg, reset_mask,
++					    &readback);
++		if (!ret && readback != 1)
++			ret = -EIO;
++	}
++
++	/*
++	 * Do this unconditionally. A failed MDIO write can be ambiguous:
++	 * the switch may have accepted it even if the controller reports
++	 * an error afterwards.
++	 */
++	clear_ret = rtl837x_reg_bits_write(priv, reset_reg, reset_mask, 0);
++	if (!clear_ret) {
++		clear_ret = rtl837x_reg_bits_read(priv, reset_reg, reset_mask,
++						  &readback);
++		if (!clear_ret && readback)
++			clear_ret = -EIO;
++	}
++
++	if (clear_ret)
++		dev_err(priv->dev,
++			"failed to clear egress bandwidth reset bit %#x at %#x: %d\n",
++			reset_mask, reset_reg, clear_ret);
++
++	return ret ? ret : clear_ret;
++}
++
++static int
++rtl8372n_qos_egbw_readback_locked(struct rtl837x_priv *priv,
++				  const struct rtl8372n_qos_egbw_location *location,
++				  u32 ctrl, u32 burst)
++{
++	u32 readback;
++	int ret;
++
++	ret = rtl837x_reg_read(priv, location->ctrl_reg, &readback);
++	if (ret)
++		return ret;
++
++	if ((readback & (RTL8372N_QOS_EGBW_ENABLE |
++			 RTL8372N_QOS_EGBW_RATE_MASK)) != ctrl)
++		return -EIO;
++
++	ret = rtl837x_reg_read(priv, location->ctrl_reg + 4, &readback);
++	if (ret)
++		return ret;
++
++	if ((readback & RTL8372N_QOS_EGBW_BURST_MASK) != burst)
++		return -EIO;
++
++	return 0;
++}
++
++static void
++rtl8372n_qos_egbw_restore_locked(struct rtl837x_priv *priv,
++				 const struct rtl8372n_qos_egbw_location *location,
++				 u32 old_ctrl, u32 old_burst)
++{
++	u32 readback;
++	int ret;
++
++	ret = rtl837x_reg_write(priv, location->ctrl_reg + 4, old_burst);
++	if (!ret)
++		ret = rtl837x_reg_write(priv, location->ctrl_reg, old_ctrl);
++	if (!ret)
++		ret = rtl837x_reg_read(priv, location->ctrl_reg, &readback);
++	if (!ret && readback != old_ctrl)
++		ret = -EIO;
++	if (!ret)
++		ret = rtl837x_reg_read(priv, location->ctrl_reg + 4, &readback);
++	if (!ret && readback != old_burst)
++		ret = -EIO;
++
++	if (ret)
++		dev_err(priv->dev,
++			"failed to restore egress bandwidth state at %#x: %d\n",
++			location->ctrl_reg, ret);
++}
++
++static int
++rtl8372n_qos_egbw_program_locked(struct rtl837x_priv *priv,
++				 const struct rtl8372n_qos_egbw_location *location,
++				 u32 rate, u32 burst)
++{
++	u32 old_ctrl;
++	u32 old_burst;
++	u32 ctrl;
++	u32 readback;
++	int ret;
++
++	ret = rtl837x_reg_read(priv, location->ctrl_reg, &old_ctrl);
++	if (ret)
++		return ret;
++
++	ret = rtl837x_reg_read(priv, location->ctrl_reg + 4, &old_burst);
++	if (ret)
++		return ret;
++
++	ctrl = RTL8372N_QOS_EGBW_ENABLE | rate;
++
++	ret = rtl837x_reg_write(priv, location->ctrl_reg + 4, burst);
++	if (ret)
++		goto restore;
++
++	ret = rtl837x_reg_read(priv, location->ctrl_reg + 4, &readback);
++	if (ret)
++		goto restore;
++
++	if ((readback & RTL8372N_QOS_EGBW_BURST_MASK) != burst) {
++		ret = -EIO;
++		goto restore;
++	}
++
++	ret = rtl8372n_qos_bits_write_verify(priv, location->ctrl_reg,
++					     RTL8372N_QOS_EGBW_ENABLE |
++					     RTL8372N_QOS_EGBW_RATE_MASK,
++					     ctrl);
++	if (ret)
++		goto restore;
++
++	ret = rtl8372n_qos_egbw_readback_locked(priv, location, ctrl, burst);
++	if (ret)
++		goto restore;
++
++	ret = rtl8372n_qos_egbw_reset_locked(priv, location->reset_reg,
++					     location->reset_mask);
++	if (!ret)
++		return 0;
++
++restore:
++	rtl8372n_qos_egbw_restore_locked(priv, location, old_ctrl, old_burst);
++
++	return ret;
++}
++
++static int
++rtl8372n_qos_egbw_disable_locked(struct rtl837x_priv *priv,
++				 const struct rtl8372n_qos_egbw_location *location)
++{
++	/*
++	 * Do not reset the queue/port on destroy. Clearing enable preserves
++	 * ETS queue mapping and scheduler configuration, as well as the
++	 * programmed rate/burst values for diagnostic readback.
++	 */
++	return rtl8372n_qos_bits_write_verify(priv, location->ctrl_reg,
++					      RTL8372N_QOS_EGBW_ENABLE, 0);
++}
++
++static int
++rtl8372n_qos_tbf_replace_locked(struct dsa_switch *ds, int port,
++				 struct tc_tbf_qopt_offload *qopt)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct tc_tbf_qopt_offload_replace_params *params =
++		&qopt->replace_params;
++	struct rtl8372n_qos_egbw_location location;
++	u64 rate_kbps;
++	u64 rate_units;
++	u32 *active_handle;
++	int ret;
++
++	/*
++	 * A root TBF replaces the root qdisc and therefore cannot coexist
++	 * with an ETS root qdisc. Queue TBF is allowed only beneath ETS.
++ */
++	if (qopt->parent == TC_H_ROOT && chip_data->qos_ets_handle[port])
++		return -EBUSY;
++
++	ret = rtl8372n_qos_tbf_location_locked(chip_data, port, qopt->parent,
++					       &location);
++	if (ret)
++		return ret;
++
++	active_handle = location.root ?
++		&chip_data->qos_tbf_root_handle[port] :
++		&chip_data->qos_tbf_queue_handle[port][location.queue];
++
++	if (*active_handle && *active_handle != qopt->handle)
++		return -EBUSY;
++
++	/*
++	 * tc_tbf reports bytes/s. Divide by 125 to convert to decimal
++	 * kbit/s, then round up to the RTL8372N 16-kbit/s rate quantum.
++	 * Rounding upward ensures the programmed limiter is never below
++	 * the requested Linux rate solely because of representation loss.
++	 */
++	rate_kbps = DIV_ROUND_UP_ULL(params->rate.rate_bytes_ps, 125);
++	rate_units = DIV_ROUND_UP_ULL(rate_kbps,
++				      RTL8372N_QOS_EGBW_RATE_UNIT_KBPS);
++
++	if (!rate_units || rate_units > RTL8372N_QOS_EGBW_RATE_MAX)
++		return -ERANGE;
++
++	if (!params->max_size ||
++	    params->max_size > RTL8372N_QOS_EGBW_BURST_MASK)
++		return -ERANGE;
++
++	ret = rtl8372n_qos_egbw_program_locked(priv, &location, rate_units,
++					       params->max_size);
++	if (ret)
++		return ret;
++
++	*active_handle = qopt->handle;
++
++	return 0;
++}
++
++static int
++rtl8372n_qos_tbf_destroy_locked(struct dsa_switch *ds, int port,
++				 struct tc_tbf_qopt_offload *qopt)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	struct rtl8372n *chip_data = priv->chip_data;
++	struct rtl8372n_qos_egbw_location location;
++	u32 *active_handle;
++	int ret;
++
++	ret = rtl8372n_qos_tbf_location_locked(chip_data, port, qopt->parent,
++					       &location);
++	if (ret)
++		return ret;
++
++	active_handle = location.root ?
++		&chip_data->qos_tbf_root_handle[port] :
++		&chip_data->qos_tbf_queue_handle[port][location.queue];
++
++	if (!*active_handle || *active_handle != qopt->handle)
++		return -ENOENT;
++
++	ret = rtl8372n_qos_egbw_disable_locked(priv, &location);
++	if (ret)
++		return ret;
++
++	*active_handle = 0;
++
++	return 0;
++}
++
++static int
++rtl8372n_qos_tbf_locked(struct dsa_switch *ds, int port,
++			 struct tc_tbf_qopt_offload *qopt)
++{
++	switch (qopt->command) {
++	case TC_TBF_REPLACE:
++		return rtl8372n_qos_tbf_replace_locked(ds, port, qopt);
++	case TC_TBF_DESTROY:
++		return rtl8372n_qos_tbf_destroy_locked(ds, port, qopt);
++	case TC_TBF_STATS:
++	case TC_TBF_GRAFT:
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static int rtl8372n_port_setup_tc(struct dsa_switch *ds, int port,
+ 				  enum tc_setup_type type, void *type_data)
+ {
+@@ -3477,6 +3841,9 @@ static int rtl8372n_port_setup_tc(struct
+ 	case TC_SETUP_QDISC_ETS:
+ 		ret = rtl8372n_qos_ets_locked(ds, port, type_data);
+ 		break;
++	case TC_SETUP_QDISC_TBF:
++		ret = rtl8372n_qos_tbf_locked(ds, port, type_data);
++		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+ 		break;
