@@ -6,31 +6,78 @@
  #include <linux/regmap.h>
  #include <linux/if_bridge.h>
  #include <linux/mutex.h>
-@@ -49,6 +50,10 @@
+@@ -49,6 +50,11 @@
  #define RTL8372N_QOS_EGBW_RATE_MAX		FIELD_MAX(RTL8372N_QOS_EGBW_RATE_MASK)
  #define RTL8372N_QOS_EGBW_BURST_MASK	GENMASK(15, 0)
  
 +#define RTL8372N_IGBW_RATE_UNIT_KBPS	16
++#define RTL8372N_IGBW_RATE_UNIT_BPS		16000
 +#define RTL8372N_IGBW_BURST_MIN			2
-+#define RTL8372N_IGBW_BURST_MASK		0x7fffffffU
++#define RTL8372N_IGBW_BURST_FIELD_MASK	GENMASK(30, 0)
 +
  // TODO: this should check port is serdes mode or port mode
  #define IS_SERDES_PORT(port) (((port)==3)||((port)==8))
  
-@@ -3822,6 +3827,325 @@ rtl8372n_qos_tbf_locked(struct dsa_switc
+@@ -312,6 +318,12 @@ struct rtl8372n {
+ 	u32 qos_ets_handle[RTL8372N_NUM_PORTS];
+ 	u32 qos_tbf_root_handle[RTL8372N_NUM_PORTS];
+ 	u32 qos_tbf_queue_handle[RTL8372N_NUM_PORTS][RTL8372N_QOS_QUEUES];
++
++	/* Ingress Policer */
++	u16 igbw_policer_mask;
++	bool igbw_fc_restore[RTL8372N_NUM_PORTS];
++	bool igbw_inc_ifg_restore;
++	bool igbw_inc_ifg_saved;
+ };
+ 
+ /*
+@@ -375,6 +387,11 @@ static int rtl8372n_detect(struct rtl837
+ 	mutex_init(&chip_data->config_lock);
+ 	chip_data->cpu_port = -1;
+ 
++	chip_data->igbw_policer_mask = 0;
++	chip_data->igbw_inc_ifg_restore = false;
++	chip_data->igbw_inc_ifg_saved = false;
++	memset(chip_data->igbw_fc_restore, 0, sizeof(chip_data->igbw_fc_restore));
++
+ 	ret = rtl837x_reg_read(priv, RTL8373_MODEL_NAME_INFO_ADDR, &val);
+     dev_info(dev, "CHIP_ID: 0x%08x \n", val);
+ 
+@@ -3818,6 +3835,466 @@ rtl8372n_qos_tbf_locked(struct dsa_switc
  	}
  }
  
++struct rtl8372n_igbw_snapshot {
++	bool include_ifg;
++	bool flow_control;
++	bool enabled;
++	u32 rate;
++	u32 burst_high_on;
++	u32 burst_high_off;
++	u32 drop_threshold;
++};
++
 +/*
-+ * Ingress bandwidth control is independent of the egress TBF hardware.
-+ * All callers must hold chip_data->config_lock.
++ * rtl837x_reg_bits_write() takes an unshifted field value and shifts it
++ * internally according to mask. Validate that the caller has supplied an
++ * unshifted value which fits entirely inside the selected field.
++ *
++ * All callers hold chip_data->config_lock.
 + */
 +static int
-+rtl8372n_igbw_bits_write_verify_locked(struct rtl837x_priv *priv,
-+				       u32 reg, u32 mask, u32 value)
++rtl8372n_igbw_field_write_verify_locked(struct rtl837x_priv *priv,
++					 u32 reg, u32 mask, u32 value)
 +{
++	u32 field_max;
 +	u32 readback;
 +	int ret;
++
++	if (!mask)
++		return -EINVAL;
++
++	field_max = mask >> __ffs(mask);
++	if (value & ~field_max)
++		return -ERANGE;
 +
 +	ret = rtl837x_reg_bits_write(priv, reg, mask, value);
 +	if (ret)
@@ -43,218 +90,267 @@
 +	return readback == value ? 0 : -EIO;
 +}
 +
++/*
++ * DROP_THR occupies the full 32-bit register word, unlike the two 31-bit
++ * burst threshold words. Full-word write/readback is therefore correct only
++ * for this register.
++ */
 +static int
-+rtl8372n_igbw_write_verify_locked(struct rtl837x_priv *priv,
-+				  u32 reg, u32 value)
++rtl8372n_igbw_drop_write_verify_locked(struct rtl837x_priv *priv, int port,
++					u32 threshold)
 +{
 +	u32 readback;
 +	int ret;
 +
-+	ret = rtl837x_reg_write(priv, reg, value);
++	ret = rtl837x_reg_write(priv, RTL8373_IGBW_PORT_DROP_CTRL_ADDR(port),
++				threshold);
 +	if (ret)
 +		return ret;
 +
-+	ret = rtl837x_reg_read(priv, reg, &readback);
++	ret = rtl837x_reg_read(priv, RTL8373_IGBW_PORT_DROP_CTRL_ADDR(port),
++			       &readback);
 +	if (ret)
 +		return ret;
 +
-+	return readback == value ? 0 : -EIO;
++	return readback == threshold ? 0 : -EIO;
 +}
 +
 +/*
-+ * The reset bit is software-cleared. Try to clear it even if asserting the
-+ * bit, or the assertion readback, failed: an MDIO transaction error may be
-+ * reported after the switch has accepted the write.
++ * IGBW burst HIGH_ON and HIGH_OFF are physically represented as two
++ * consecutive 32-bit registers. Each has a 31-bit valid field; bit 31 is
++ * reserved and must not participate in write or readback comparisons.
++ */
++static int
++rtl8372n_igbw_burst_write_verify_locked(struct rtl837x_priv *priv, u32 reg,
++					 u32 burst)
++{
++	return rtl8372n_igbw_field_write_verify_locked(
++		priv, reg, RTL8372N_IGBW_BURST_FIELD_MASK, burst);
++}
++
++/*
++ * The token-bucket reset bit is software-cleared. Always attempt the clear,
++ * even if assertion or assertion readback failed: an MDIO error can occur
++ * after the switch has accepted the write.
 + */
 +static int
 +rtl8372n_igbw_reset_locked(struct rtl837x_priv *priv, int port)
 +{
 +	u32 reset_reg = RTL8373_IGBW_PORT_LB_RST_ADDR(port);
 +	u32 reset_mask = RTL8373_IGBW_PORT_LB_RST_RST_MASK(port);
-+	u32 readback;
 +	int ret;
 +	int clear_ret;
 +
-+	ret = rtl837x_reg_bits_write(priv, reset_reg, reset_mask, 1);
-+	if (!ret) {
-+		ret = rtl837x_reg_bits_read(priv, reset_reg, reset_mask,
-+					    &readback);
-+		if (!ret && readback != 1)
-+			ret = -EIO;
-+	}
++	ret = rtl8372n_igbw_field_write_verify_locked(priv, reset_reg,
++						       reset_mask, 1);
 +
-+	/*
-+	 * Always clear the reset request. Do not leave an ingress policer
-+	 * bucket in reset state after a partial programming failure.
-+	 */
-+	clear_ret = rtl837x_reg_bits_write(priv, reset_reg, reset_mask, 0);
-+	if (!clear_ret) {
-+		clear_ret = rtl837x_reg_bits_read(priv, reset_reg, reset_mask,
-+						  &readback);
-+		if (!clear_ret && readback)
-+			clear_ret = -EIO;
-+	}
-+
++	clear_ret = rtl8372n_igbw_field_write_verify_locked(priv, reset_reg,
++							     reset_mask, 0);
 +	if (clear_ret)
 +		dev_err(priv->dev,
-+			"failed to clear ingress bandwidth reset on port %d: %d\n",
++			"failed to clear ingress policer reset on port %d: %d\n",
 +			port, clear_ret);
 +
 +	return ret ? ret : clear_ret;
 +}
 +
-+static void
-+rtl8372n_igbw_restore_locked(struct rtl837x_priv *priv, int port,
-+			     u32 old_global_ctrl, u32 old_fc_ctrl,
-+			     u32 old_port_ctrl, u32 old_drop,
-+			     u32 old_burst_low, u32 old_burst_high)
++static void rtl8372n_igbw_record_error(int *first_error, int error)
 +{
-+	u32 port_ctrl_reg = RTL8373_IGBW_PORT_CTRL_ADDR(port);
-+	u32 burst_reg = RTL8373_IGBW_PORT_BURST_CTRL_ADDR(port);
-+	int ret = 0;
-+	int restore_ret;
-+
-+	/*
-+	 * Disable the port rate limiter while restoring its thresholds, then
-+	 * restore the original control word as the final step.
-+	 */
-+	restore_ret = rtl837x_reg_bits_write(priv, port_ctrl_reg,
-+					     RTL8373_IGBW_PORT_CTRL_BW_EN_MASK,
-+					     0);
-+	if (!ret && restore_ret)
-+		ret = restore_ret;
-+
-+	restore_ret = rtl837x_reg_write(priv,
-+					RTL8373_IGBW_PORT_DROP_CTRL_ADDR(port),
-+					old_drop);
-+	if (!ret && restore_ret)
-+		ret = restore_ret;
-+
-+	restore_ret = rtl837x_reg_write(priv, burst_reg, old_burst_low);
-+	if (!ret && restore_ret)
-+		ret = restore_ret;
-+
-+	restore_ret = rtl837x_reg_write(priv, burst_reg + 4, old_burst_high);
-+	if (!ret && restore_ret)
-+		ret = restore_ret;
-+
-+	restore_ret = rtl837x_reg_write(priv, RTL8373_IGBW_PORT_FC_CTRL_ADDR(port),
-+					old_fc_ctrl);
-+	if (!ret && restore_ret)
-+		ret = restore_ret;
-+
-+	restore_ret = rtl837x_reg_write(priv, RTL8373_IGBW_CTRL_ADDR,
-+					old_global_ctrl);
-+	if (!ret && restore_ret)
-+		ret = restore_ret;
-+
-+	restore_ret = rtl837x_reg_write(priv, port_ctrl_reg, old_port_ctrl);
-+	if (!ret && restore_ret)
-+		ret = restore_ret;
-+
-+	if (ret)
-+		dev_err(priv->dev,
-+			"failed to restore ingress policer state on port %d: %d\n",
-+			port, ret);
++	if (!*first_error && error)
++		*first_error = error;
 +}
 +
 +static int
-+rtl8372n_igbw_program_locked(struct rtl837x_priv *priv, int port,
-+			     u32 rate_units, u32 burst)
++rtl8372n_igbw_snapshot_locked(struct rtl837x_priv *priv, int port,
++			       struct rtl8372n_igbw_snapshot *snapshot)
 +{
-+	u32 port_ctrl_reg = RTL8373_IGBW_PORT_CTRL_ADDR(port);
 +	u32 burst_reg = RTL8373_IGBW_PORT_BURST_CTRL_ADDR(port);
-+	u32 old_global_ctrl;
-+	u32 old_fc_ctrl;
-+	u32 old_port_ctrl;
-+	u32 old_drop;
-+	u32 old_burst_low;
-+	u32 old_burst_high;
-+	u32 burst_high = burst / 2;
++	u32 value;
 +	int ret;
 +
-+	ret = rtl837x_reg_read(priv, RTL8373_IGBW_CTRL_ADDR, &old_global_ctrl);
++	memset(snapshot, 0, sizeof(*snapshot));
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_IGBW_CTRL_ADDR,
++				    RTL8373_IGBW_CTRL_INC_IFG_MASK, &value);
++	if (ret)
++		return ret;
++	snapshot->include_ifg = !!value;
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_IGBW_PORT_FC_CTRL_ADDR(port),
++				    RTL8373_IGBW_PORT_FC_CTRL_EN_MASK(port),
++				    &value);
++	if (ret)
++		return ret;
++	snapshot->flow_control = !!value;
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++				    RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, &value);
++	if (ret)
++		return ret;
++	snapshot->enabled = !!value;
++
++	ret = rtl837x_reg_bits_read(priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++				    RTL8373_IGBW_PORT_CTRL_RATE_MASK,
++				    &snapshot->rate);
 +	if (ret)
 +		return ret;
 +
-+	ret = rtl837x_reg_read(priv, RTL8373_IGBW_PORT_FC_CTRL_ADDR(port),
-+			       &old_fc_ctrl);
++	ret = rtl837x_reg_bits_read(priv, burst_reg,
++				    RTL8372N_IGBW_BURST_FIELD_MASK,
++				    &snapshot->burst_high_on);
 +	if (ret)
 +		return ret;
 +
-+	ret = rtl837x_reg_read(priv, port_ctrl_reg, &old_port_ctrl);
++	ret = rtl837x_reg_bits_read(priv, burst_reg + 4,
++				    RTL8372N_IGBW_BURST_FIELD_MASK,
++				    &snapshot->burst_high_off);
 +	if (ret)
 +		return ret;
 +
 +	ret = rtl837x_reg_read(priv, RTL8373_IGBW_PORT_DROP_CTRL_ADDR(port),
-+			       &old_drop);
++				    &snapshot->drop_threshold);
 +	if (ret)
 +		return ret;
 +
-+	ret = rtl837x_reg_read(priv, burst_reg, &old_burst_low);
-+	if (ret)
-+		return ret;
++	return 0;
++}
 +
-+	ret = rtl837x_reg_read(priv, burst_reg + 4, &old_burst_high);
++/*
++ * Restore only fields touched by ingress policer programming. In particular,
++ * IGBW_CTRL and IGBW_PORT_FC_CTRL are packed/shared registers, so restoring
++ * their complete 32-bit values would risk clobbering unrelated ports or
++ * global admission/bypass policy.
++ *
++ * This is best-effort rollback. Preserve the first failure but continue with
++ * every restoration step.
++ */
++static void
++rtl8372n_igbw_restore_locked(struct rtl837x_priv *priv, int port,
++			     const struct rtl8372n_igbw_snapshot *snapshot)
++{
++	u32 burst_reg = RTL8373_IGBW_PORT_BURST_CTRL_ADDR(port);
++	int first_error = 0;
++	int ret;
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, 0);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	ret = rtl8372n_igbw_drop_write_verify_locked(priv, port,
++						      snapshot->drop_threshold);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	ret = rtl8372n_igbw_burst_write_verify_locked(
++		priv, burst_reg, snapshot->burst_high_on);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	ret = rtl8372n_igbw_burst_write_verify_locked(
++		priv, burst_reg + 4, snapshot->burst_high_off);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_CTRL_RATE_MASK, snapshot->rate);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_FC_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_FC_CTRL_EN_MASK(port),
++		snapshot->flow_control);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_CTRL_ADDR,
++		RTL8373_IGBW_CTRL_INC_IFG_MASK, snapshot->include_ifg);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, snapshot->enabled);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	if (first_error)
++		dev_err(priv->dev,
++			"failed to restore ingress policer state on port %d: %d\n",
++			port, first_error);
++}
++
++/*
++ * Program one port ingress policer. The unit is 16 kbit/s and tc police
++ * supplies bytes/s, so rate_units is calculated as:
++ *
++ *   ceil(rate_bytes_per_sec * 8 / 16000)
++ * = ceil(rate_bytes_per_sec / 2000)
++ *
++ * This avoids the premature truncation in a bytes/s -> kbit/s -> hardware
++ * unit conversion and guarantees the programmed representable rate is not
++ * lower than the requested Linux rate merely due to rounding.
++ */
++static int
++rtl8372n_igbw_program_locked(struct rtl837x_priv *priv, int port,
++			      u32 rate_units, u32 burst,
++			      struct rtl8372n_igbw_snapshot *snapshot)
++{
++	u32 burst_reg = RTL8373_IGBW_PORT_BURST_CTRL_ADDR(port);
++	u32 burst_high_off = burst / 2;
++	int ret;
++
++	ret = rtl8372n_igbw_snapshot_locked(priv, port, snapshot);
 +	if (ret)
 +		return ret;
 +
 +	/*
-+	 * tc police accounts data bytes. Exclude Ethernet preamble and IFG,
-+	 * and make excess traffic drop instead of pausing the sender.
++	 * Avoid changing burst/rate values while an old policer instance is
++	 * active. The original enable state is restored by rollback if a
++	 * subsequent operation fails.
 +	 */
-+	ret = rtl8372n_igbw_bits_write_verify_locked(priv,
-+				RTL8373_IGBW_CTRL_ADDR,
-+				RTL8373_IGBW_CTRL_INC_IFG_MASK, 0);
-+	if (ret)
-+		goto restore;
-+
-+	ret = rtl8372n_igbw_bits_write_verify_locked(priv,
-+				RTL8373_IGBW_PORT_FC_CTRL_ADDR(port),
-+				RTL8373_IGBW_PORT_FC_CTRL_EN_MASK(port), 0);
-+	if (ret)
-+		goto restore;
-+
-+	ret = rtl8372n_igbw_write_verify_locked(priv,
-+				RTL8373_IGBW_PORT_DROP_CTRL_ADDR(port), burst);
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, 0);
 +	if (ret)
 +		goto restore;
 +
 +	/*
-+	 * RTL8372N uses two ingress burst thresholds,
-+	 * programming sequence: HIGH_ON = burst and
-+	 * HIGH_OFF = burst / 2.
++	 * tc police accounts payload bytes. Exclude preamble/IFG from IGBW
++	 * accounting and turn off IGBW flow-control so excess traffic is
++	 * dropped instead of being paused.
 +	 */
-+	ret = rtl8372n_igbw_write_verify_locked(priv, burst_reg, burst);
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_CTRL_ADDR,
++		RTL8373_IGBW_CTRL_INC_IFG_MASK, 0);
 +	if (ret)
 +		goto restore;
 +
-+	ret = rtl8372n_igbw_write_verify_locked(priv, burst_reg + 4,
-+						 burst_high);
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_FC_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_FC_CTRL_EN_MASK(port), 0);
 +	if (ret)
 +		goto restore;
 +
-+	ret = rtl8372n_igbw_bits_write_verify_locked(priv, port_ctrl_reg,
-+				RTL8373_IGBW_PORT_CTRL_BW_EN_MASK |
-+				RTL8373_IGBW_PORT_CTRL_RATE_MASK,
-+				RTL8373_IGBW_PORT_CTRL_BW_EN_MASK ?
-+				0 : 0);
++	ret = rtl8372n_igbw_drop_write_verify_locked(priv, port, burst);
 +	if (ret)
 +		goto restore;
 +
-+	/*
-+	 * rtl837x_reg_bits_write() expects an unshifted field value. The
-+	 * rate field starts at bit zero, while the enable bit is programmed
-+	 * separately to avoid passing an already-shifted value.
-+	 */
-+	ret = rtl8372n_igbw_bits_write_verify_locked(priv, port_ctrl_reg,
-+				RTL8373_IGBW_PORT_CTRL_RATE_MASK, rate_units);
++	ret = rtl8372n_igbw_burst_write_verify_locked(priv, burst_reg, burst);
 +	if (ret)
 +		goto restore;
 +
-+	ret = rtl8372n_igbw_bits_write_verify_locked(priv, port_ctrl_reg,
-+				RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, 1);
-+if (ret)
++	ret = rtl8372n_igbw_burst_write_verify_locked(priv, burst_reg + 4,
++						       burst_high_off);
++	if (ret)
++		goto restore;
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_CTRL_RATE_MASK, rate_units);
++	if (ret)
++		goto restore;
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, 1);
++	if (ret)
 +		goto restore;
 +
 +	ret = rtl8372n_igbw_reset_locked(priv, port);
@@ -262,9 +358,7 @@
 +		return 0;
 +
 +restore:
-+	rtl8372n_igbw_restore_locked(priv, port, old_global_ctrl, old_fc_ctrl,
-+				     old_port_ctrl, old_drop, old_burst_low,
-+				     old_burst_high);
++	rtl8372n_igbw_restore_locked(priv, port, snapshot);
 +	return ret;
 +}
 +
@@ -274,33 +368,60 @@
 +{
 +	struct rtl837x_priv *priv = ds->priv;
 +	struct rtl8372n *chip_data = priv->chip_data;
-+	u64 rate_kbps;
++	struct rtl8372n_igbw_snapshot snapshot;
 +	u64 rate_units;
++	u16 port_bit;
++	bool first_policer;
++	bool already_active;
 +	int ret;
 +
 +	if (!rtl8372n_port_is_user(ds, port))
 +		return -EOPNOTSUPP;
 +
 +	/*
-+	 * dsa_mall_policer_tc_entry contains only byte-rate and burst. DSA
-+	 * validates unsupported police modes and action combinations before
-+	 * invoking this driver callback.
++	 * dsa_mall_policer_tc_entry exposes only byte-rate and byte-burst.
++	 * DSA core rejects police modes/actions that are not representable
++	 * through this callback, including packet rate, peakrate, avrate,
++	 * overhead, or a non-pass/non-drop action combination.
 +	 */
-+	rate_kbps = div_u64(policer->rate_bytes_per_sec, 125);
-+	rate_units = DIV_ROUND_UP_ULL(rate_kbps,
-+				      RTL8372N_IGBW_RATE_UNIT_KBPS);
++	rate_units = DIV_ROUND_UP_ULL(policer->rate_bytes_per_sec,
++				      RTL8372N_IGBW_RATE_UNIT_BPS / 8);
 +
 +	if (!rate_units ||
-+	    rate_units > RTL8373_IGBW_PORT_CTRL_RATE_MASK ||
++	    rate_units > FIELD_MAX(RTL8373_IGBW_PORT_CTRL_RATE_MASK) ||
 +	    policer->burst < RTL8372N_IGBW_BURST_MIN ||
-+	    policer->burst > RTL8372N_IGBW_BURST_MASK)
++	    policer->burst > RTL8372N_IGBW_BURST_FIELD_MASK)
 +		return -ERANGE;
++
++	port_bit = BIT(port);
 +
 +	mutex_lock(&chip_data->config_lock);
 +
-+	ret = rtl8372n_igbw_program_locked(priv, port, (u32)rate_units,
-+					   (u32)policer->burst);
++	already_active = !!(chip_data->igbw_policer_mask & port_bit);
++	first_policer = !chip_data->igbw_policer_mask;
 +
++	ret = rtl8372n_igbw_program_locked(priv, port, (u32)rate_units,
++					   policer->burst, &snapshot);
++	if (ret)
++		goto out_unlock;
++
++	/*
++	 * Preserve the state from before the first successful ownership of
++	 * this port. Replacing an existing DSA policer must not overwrite
++	 * the original flow-control or global IFG state with its currently
++	 * forced-off values.
++	 */
++	if (!already_active) {
++		chip_data->igbw_fc_restore[port] = snapshot.flow_control;
++		chip_data->igbw_policer_mask |= port_bit;
++	}
++
++	if (first_policer) {
++	chip_data->igbw_inc_ifg_restore = snapshot.include_ifg;
++		chip_data->igbw_inc_ifg_saved = true;
++	}
++
++out_unlock:
 +	mutex_unlock(&chip_data->config_lock);
 +
 +	return ret;
@@ -310,40 +431,86 @@
 +{
 +	struct rtl837x_priv *priv = ds->priv;
 +	struct rtl8372n *chip_data = priv->chip_data;
-+	u32 port_ctrl_reg;
++	u16 port_bit;
++	bool restore_ifg;
++	bool restore_fc;
++	bool active;
++	int first_error = 0;
 +	int ret;
-+	int reset_ret;
 +
 +	if (!rtl8372n_port_is_user(ds, port))
 +		return;
 +
-+	port_ctrl_reg = RTL8373_IGBW_PORT_CTRL_ADDR(port);
++	port_bit = BIT(port);
 +
 +	mutex_lock(&chip_data->config_lock);
 +
-+	ret = rtl8372n_igbw_bits_write_verify_locked(priv, port_ctrl_reg,
-+				RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, 0);
++	active = !!(chip_data->igbw_policer_mask & port_bit);
++	if (!active)
++		goto out_unlock;
++
++	restore_fc = chip_data->igbw_fc_restore[port];
++	restore_ifg = chip_data->igbw_inc_ifg_saved &&
++		      chip_data->igbw_policer_mask == port_bit;
++
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_CTRL_BW_EN_MASK, 0);
++	rtl8372n_igbw_record_error(&first_error, ret);
 +
 +	/*
-+	 * Reset even if disabling reported an error, because the write may
-+	 * have reached the switch before the MDIO transaction failed.
++	 * Clear token state even when disabling returned an error: the
++	 * register write may have reached the switch before MDIO reported
++	 * the transaction failure.
 +	 */
-+	reset_ret = rtl8372n_igbw_reset_locked(priv, port);
-+	if (!ret)
-+		ret = reset_ret;
++	ret = rtl8372n_igbw_reset_locked(priv, port);
++	rtl8372n_igbw_record_error(&first_error, ret);
 +
++	ret = rtl8372n_igbw_field_write_verify_locked(
++		priv, RTL8373_IGBW_PORT_FC_CTRL_ADDR(port),
++		RTL8373_IGBW_PORT_FC_CTRL_EN_MASK(port), restore_fc);
++	rtl8372n_igbw_record_error(&first_error, ret);
++
++	/*
++	 * INCLUDE_IFG is global. Keep it cleared while any ingress policer
++	 * remains active and restore the pre-driver value only after the
++	 * final active port has been removed.
++	 */
++	if (restore_ifg) {
++		ret = rtl8372n_igbw_field_write_verify_locked(
++			priv, RTL8373_IGBW_CTRL_ADDR,
++			RTL8373_IGBW_CTRL_INC_IFG_MASK,
++			chip_data->igbw_inc_ifg_restore);
++		rtl8372n_igbw_record_error(&first_error, ret);
++	}
++
++	/*
++	 * port_policer_del() cannot report an error to DSA. Make a complete
++	 * best-effort hardware cleanup and release software ownership even
++	 * if MDIO access failed; a subsequent add will take a fresh hardware
++	 * snapshot instead of retaining stale restore state.
++	 */
++	chip_data->igbw_policer_mask &= ~port_bit;
++	chip_data->igbw_fc_restore[port] = false;
++
++	if (!chip_data->igbw_policer_mask) {
++		chip_data->igbw_inc_ifg_restore = false;
++		chip_data->igbw_inc_ifg_saved = false;
++	}
++
++out_unlock:
 +	mutex_unlock(&chip_data->config_lock);
 +
-+	if (ret)
++	if (first_error)
 +		dev_err(priv->dev,
 +			"failed to disable ingress policer on port %d: %d\n",
-+			port, ret);
++			port, first_error);
 +}
 +
  static int rtl8372n_port_setup_tc(struct dsa_switch *ds, int port,
  				  enum tc_setup_type type, void *type_data)
  {
-@@ -4653,6 +4977,8 @@ static const struct dsa_switch_ops rtl83
+@@ -4660,6 +5137,8 @@ static const struct dsa_switch_ops rtl83
  	.port_lag_change = rtl8372n_port_lag_change,
  	.lag_fdb_add     = rtl8372n_lag_fdb_add,
  	.lag_fdb_del     = rtl8372n_lag_fdb_del,

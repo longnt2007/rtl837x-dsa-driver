@@ -22,7 +22,7 @@
  };
  
  /*
-@@ -3229,6 +3237,15 @@ static int rtl8372n_qos_hw_init(struct d
+@@ -3225,6 +3233,15 @@ static int rtl8372n_qos_hw_init(struct d
  			ret = rtl8372n_qos_port_reset_locked(priv, dp->index);
  	}
  
@@ -38,7 +38,7 @@
  	if (!ret) {
  		memset(chip_data->qos_profile_ports, 0,
  		       sizeof(chip_data->qos_profile_ports));
-@@ -3238,6 +3255,10 @@ static int rtl8372n_qos_hw_init(struct d
+@@ -3234,6 +3251,10 @@ static int rtl8372n_qos_hw_init(struct d
  		       sizeof(chip_data->qos_port_profile));
  		memset(chip_data->qos_ets_handle, 0,
  		       sizeof(chip_data->qos_ets_handle));
@@ -49,7 +49,7 @@
  
  		chip_data->qos_profile_ports[0] = user_mask;
  		chip_data->qos_profile_sources[0] =
-@@ -3424,6 +3445,12 @@ static int rtl8372n_qos_ets_destroy_lock
+@@ -3420,6 +3441,12 @@ static int rtl8372n_qos_ets_destroy_lock
  	struct rtl8372n *chip_data = priv->chip_data;
  	struct rtl8372n_qos_port_state old_state;
  	int ret;
@@ -62,7 +62,7 @@
  
  	ret = rtl8372n_qos_port_state_read_locked(priv, port, &old_state);
  	if (ret)
-@@ -3458,6 +3485,343 @@ static int rtl8372n_qos_ets_locked(struc
+@@ -3454,6 +3481,343 @@ static int rtl8372n_qos_ets_locked(struc
  	}
  }
  
@@ -406,7 +406,7 @@
  static int rtl8372n_port_setup_tc(struct dsa_switch *ds, int port,
  				  enum tc_setup_type type, void *type_data)
  {
-@@ -3477,6 +3841,9 @@ static int rtl8372n_port_setup_tc(struct
+@@ -3473,6 +3837,9 @@ static int rtl8372n_port_setup_tc(struct
  	case TC_SETUP_QDISC_ETS:
  		ret = rtl8372n_qos_ets_locked(ds, port, type_data);
  		break;

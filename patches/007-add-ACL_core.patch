@@ -17,9 +17,9 @@
  #include <net/pkt_sched.h>
  #include <net/pkt_cls.h>
  
-@@ -54,6 +60,32 @@
+@@ -55,6 +61,32 @@
  #define RTL8372N_IGBW_BURST_MIN			2
- #define RTL8372N_IGBW_BURST_MASK		0x7fffffffU
+ #define RTL8372N_IGBW_BURST_FIELD_MASK	GENMASK(30, 0)
  
 +#define RTL8372N_ACL_RULES				96
 +#define RTL8372N_ACL_COUNTERS			32
@@ -50,7 +50,7 @@
  // TODO: this should check port is serdes mode or port mode
  #define IS_SERDES_PORT(port) (((port)==3)||((port)==8))
  
-@@ -272,6 +304,28 @@ struct rtl8372n_pcs
+@@ -273,6 +305,28 @@ struct rtl8372n_pcs
  	int index;
  };
  
@@ -79,10 +79,10 @@
  struct rtl8372n {
  	struct rtl8372n_pcs pcs[RTL8372N_NUM_PORTS];
  	netdev_features_t csum_feature_backup;
-@@ -317,6 +371,13 @@ struct rtl8372n {
- 	u32 qos_ets_handle[RTL8372N_NUM_PORTS];
- 	u32 qos_tbf_root_handle[RTL8372N_NUM_PORTS];
- 	u32 qos_tbf_queue_handle[RTL8372N_NUM_PORTS][RTL8372N_QOS_QUEUES];
+@@ -324,6 +378,13 @@ struct rtl8372n {
+ 	bool igbw_fc_restore[RTL8372N_NUM_PORTS];
+ 	bool igbw_inc_ifg_restore;
+ 	bool igbw_inc_ifg_saved;
 +	
 +	/* ACL */
 +	struct rtl8372n_acl_entry acl[RTL8372N_ACL_RULES];
@@ -93,7 +93,7 @@
  };
  
  /*
-@@ -1288,6 +1349,13 @@ static int rtl8372n_change_tag_protocol(
+@@ -1300,6 +1361,13 @@ static int rtl8372n_change_tag_protocol(
  
  	mutex_lock(&chip_data->config_lock);
  
@@ -107,7 +107,7 @@
  	switch (proto) {
  	case DSA_TAG_PROTO_MXL862_8021Q:
  		ret = rtl8372n_teardown_tag_rtl(ds);
-@@ -1310,6 +1378,7 @@ static int rtl8372n_change_tag_protocol(
+@@ -1322,6 +1390,7 @@ static int rtl8372n_change_tag_protocol(
  	}
  	priv->tag_proto = proto;
  
@@ -115,7 +115,7 @@
  	mutex_unlock(&chip_data->config_lock);
  
  	return 0;
-@@ -4424,6 +4493,1006 @@ static int rtl8372n_port_get_apptrust(st
+@@ -4573,6 +4642,1006 @@ static int rtl8372n_port_get_apptrust(st
  	return 0;
  }
  
@@ -1122,7 +1122,7 @@
  enum RTL8373_MSTP_STATE
  {
      MSTP_DISABLE = 0,
-@@ -4764,6 +5833,10 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -4924,6 +5993,10 @@ static int rtl8372n_setup(struct dsa_swi
  	if (ret)
  		return ret;
  
@@ -1133,7 +1133,7 @@
  	/*
  	 * Warning! 
  	 * The following understanding may be incorrect
-@@ -4988,6 +6061,9 @@ static const struct dsa_switch_ops rtl83
+@@ -5148,6 +6221,9 @@ static const struct dsa_switch_ops rtl83
  	.port_del_dscp_prio = rtl8372n_port_del_dscp_prio,
  	.port_set_apptrust = rtl8372n_port_set_apptrust,
  	.port_get_apptrust = rtl8372n_port_get_apptrust,

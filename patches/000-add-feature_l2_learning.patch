@@ -1,6 +1,14 @@
 --- a/src/Makefile
 +++ b/src/Makefile
-@@ -19,6 +19,7 @@ endif
+@@ -2,7 +2,6 @@
+ # Copyright (C) 2025 StarField Xu <air_jinkela@163.com>
+ 
+ ccflags-y += -Wall
+-ccflags-y += -Iinclude/linux/
+ 
+ ifeq ($(CONFIG_RTL8372N_DSA_DEBUG),y)
+ ccflags-y += -DDEBUG
+@@ -19,6 +18,7 @@ endif
  rtl8372n_dsa-objs += rtl837x_dbg.o
  rtl8372n_dsa-objs += rtl837x_mdio.o
  rtl8372n_dsa-objs += rtl837x_common.o
@@ -10,7 +18,11 @@
  ccflags-y += -DRTL837X_PHY_PATCH
 --- /dev/null
 +++ b/src/rtl837x_common_l2.c
-@@ -0,0 +1,451 @@
+@@ -0,0 +1,455 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2025 StarField Xu <air_jinkela@163.com>
++ */
 +#include <linux/version.h>
 +
 +#include "rtl837x.h"
@@ -781,24 +793,7 @@
  static int rtl8372n_vlan_del(struct dsa_switch *ds, int port,
                                   const struct switchdev_obj_port_vlan *vlan)
  {
-@@ -1413,8 +1487,14 @@ static int rtl8372n_vlan_del(struct dsa_
- 	if (ret)
- 		return ret;
- 
--	vlan4k.member &= ~BIT(port);
--	vlan4k.untag &= ~BIT(port);
-+	if (vlan->vid == 1)
-+	{
-+		vlan4k.member |= BIT(port);
-+		vlan4k.untag |= BIT(port);
-+	} else {
-+		vlan4k.member &= ~BIT(port);
-+		vlan4k.untag &= ~BIT(port);
-+	}
- 
- 	if (!vlan4k.member) {
- 		vlan4k.vid = vlan->vid;
-@@ -1432,6 +1512,7 @@ static int rtl8372n_vlan_del(struct dsa_
+@@ -1432,6 +1506,7 @@ static int rtl8372n_vlan_del(struct dsa_
  	return 0;
  }
  
@@ -806,7 +801,7 @@
  static int
  rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
  			   struct dsa_bridge bridge,
-@@ -1440,17 +1521,23 @@ rtl8372n_port_bridge_join(struct dsa_swi
+@@ -1440,17 +1515,23 @@ rtl8372n_port_bridge_join(struct dsa_swi
  {
      struct rtl837x_priv *priv = ds->priv;
  	struct dsa_port *dp;
@@ -834,7 +829,7 @@
  		/* Join this port to each other port on the bridge */
  		ret = rtl8372n_port_add_isolation(priv, dp->index, BIT(port));
  		if (ret)
-@@ -1466,25 +1553,32 @@ rtl8372n_port_bridge_join(struct dsa_swi
+@@ -1466,25 +1547,32 @@ rtl8372n_port_bridge_join(struct dsa_swi
  	return ret;
  }
  
@@ -871,7 +866,16 @@
  		/* Remove this port from any other port on the bridge */
  		ret = rtl8372n_port_remove_isolation(priv, dp->index,
  					  BIT(port));
-@@ -1524,6 +1618,309 @@ static void rtl8372n_port_disable(struct
+@@ -1494,6 +1582,8 @@ rtl8372n_port_bridge_leave(struct dsa_sw
+ 		port_bitmap |= BIT(dp->index);
+ 	}
+ 
++	rtl8372n_set_pvid(priv, port, 0xfff);
++
+ 	/* Clear the bits for the ports we can not access, leave ourselves */
+ 	rtl8372n_port_remove_isolation(priv, port, port_bitmap);
+ }
+@@ -1524,6 +1614,309 @@ static void rtl8372n_port_disable(struct
  	priv->ops->phy_write_c45(priv, port, 31, 0xa610, 0x2858);
  }
  
@@ -1181,7 +1185,7 @@
  enum RTL8373_MSTP_STATE
  {
      MSTP_DISABLE = 0,
-@@ -1581,14 +1978,14 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1581,14 +1974,14 @@ static int rtl8372n_setup(struct dsa_swi
  	struct rtl8372n *chip_data = priv->chip_data;
  	struct dsa_port *cpu_dp = NULL;
  	struct dsa_port *dp;
@@ -1202,7 +1206,7 @@
  	}
  
  	// TODO: muilt CPU port support
-@@ -1617,8 +2014,6 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1617,8 +2010,6 @@ static int rtl8372n_setup(struct dsa_swi
  	chip_data->pcs[8].priv = priv;
  	chip_data->pcs[8].index = 8;
  
@@ -1211,7 +1215,7 @@
  	// set port 3 and port 8 as serdes port
  	rtl837x_reg_bits_write(priv, RTL8373_SMI_MAC_TYPE_CTRL_ADDR, 
  			 RTL8373_SMI_MAC_TYPE_CTRL_MAC_PORT8_TYPE_MASK | RTL8373_SMI_MAC_TYPE_CTRL_MAC_PORT3_TYPE_MASK,
-@@ -1638,6 +2033,9 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1638,6 +2029,9 @@ static int rtl8372n_setup(struct dsa_swi
  			 0b111
  			);
  
@@ -1221,7 +1225,7 @@
  	if (of_property_read_bool(np, "sds0-rx-swap"))
  	{
  		rtl837x_sds_reg_bits_write(priv, 0, 0, 0, 0x200, 1); //#SDS0RX PN swap
-@@ -1712,36 +2110,17 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1712,36 +2106,17 @@ static int rtl8372n_setup(struct dsa_swi
  				 0x596A
  				); //#TX_POLARITY_SWAP
  
@@ -1258,7 +1262,7 @@
  	rtl837x_reg_bits_write(priv, RTL8373_DW8051_CFG_ADDR,
  			 RTL8373_DW8051_CFG_DW8051_READY_MASK, 1
  			);
-@@ -1754,8 +2133,6 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1754,14 +2129,19 @@ static int rtl8372n_setup(struct dsa_swi
  	}
  #endif
  
@@ -1267,7 +1271,20 @@
      //RTL8372/RTL8372N/RTL8366U set polling mask 0x1f8, port 3/8 from serdes need config bit8=1
      rtl837x_reg_bits_write(priv, RTL8373_SMI_GLB_CTRL_ADDR,
  		 RTL8373_SMI_GLB_CTRL_SMI_POLLING_MASK_MASK, 0x1f8
-@@ -1778,6 +2155,22 @@ static int rtl8372n_setup(struct dsa_swi
+ 		);
+ 	msleep(5);
+ 
++
++	dsa_switch_for_each_port(dp, ds) {
++		ret = rtl8372n_port_remove_vlan_transparent(priv, dp->index, 0xffffffff);
++		if(ret)
++			return ret;
++	}
++
+ 	of_extra_init(ds);
+ 
+     ret = rtl8372n_setup_mdio(priv);
+@@ -1778,6 +2158,26 @@ static int rtl8372n_setup(struct dsa_swi
  	dsa_switch_for_each_port(dp, ds) {
  		int port = dp->index;
  
@@ -1287,10 +1304,14 @@
 +		if (ret)
 +			return ret;
 +
++		ret = rtl8372n_set_pvid(priv, port, 0xfff);
++		if (ret)
++			return ret;
++
  		rtl8372n_port_stp_state_set(ds, port, BR_STATE_DISABLED);
  
  		/* Start with all port completely isolated */
-@@ -1788,11 +2181,6 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1788,11 +2188,6 @@ static int rtl8372n_setup(struct dsa_swi
  		if (dsa_port_is_unused(dp))
  			continue;
  
@@ -1302,7 +1323,7 @@
  		// FORWARD:0, DROP:1, TO_CPU:2
  		ret = rtl837x_reg_bits_write(priv, RTL8373_L2_LRN_PORT_CONSTRT_ACT_ADDR,
  			 RTL8373_L2_LRN_PORT_CONSTRT_ACT_LRN_ACT_MASK, 0
-@@ -1800,17 +2188,7 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1800,17 +2195,7 @@ static int rtl8372n_setup(struct dsa_swi
  		if (ret)
  			return ret;
  
@@ -1321,7 +1342,7 @@
  		if (ret)
  			return ret;
  
-@@ -1818,6 +2196,7 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1818,6 +2203,7 @@ static int rtl8372n_setup(struct dsa_swi
  		ret = rtl8372n_drop_untagged(priv, port, false);
  		if (ret)
  			return ret;
@@ -1329,7 +1350,7 @@
  		// Disable Ingress filter
  		ret = rtl837x_reg_bits_write(priv, RTL8373_VLAN_PORT_IGR_FLTR_ADDR(port),
  			  RTL8373_VLAN_PORT_IGR_FLTR_IGR_FLTR_ACT_MASK(port), 0
-@@ -1842,6 +2221,11 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1842,6 +2228,11 @@ static int rtl8372n_setup(struct dsa_swi
  
  		if (!dsa_port_is_user(dp))
  			continue;
@@ -1341,7 +1362,7 @@
  		/* Forward only to the CPU */
  		ret = rtl8372n_port_set_isolation(priv, dp->index,
  						   BIT(cpu_dp->index));
-@@ -1853,14 +2237,154 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1853,14 +2244,154 @@ static int rtl8372n_setup(struct dsa_swi
  
  	ret = rtl8372n_port_set_isolation(priv, cpu_dp->index,
  						downports_mask);
@@ -1349,7 +1370,7 @@
 +		return ret;
 +
 +	struct rtl837x_vlan_4k def_vlan = {
-+		.vid=1,
++		.vid=0xfff,
 +		.member=cpu_port_mask|downports_mask,
 +		.untag=cpu_port_mask|downports_mask,
 +		.fid=0,
@@ -1499,7 +1520,7 @@
  	// FORWARD:0, DROP:1, TO_CPU:2
  	ret = rtl837x_reg_bits_write(priv, RTL8373_L2_LRN_PORT_CONSTRT_ACT_ADDR,
  			  RTL8373_L2_LRN_PORT_CONSTRT_ACT_LRN_ACT_MASK, 0
-@@ -1876,15 +2400,9 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1876,15 +2407,9 @@ static int rtl8372n_setup(struct dsa_swi
  		return ret;
  
  	// Disable vlan leaky
@@ -1516,7 +1537,7 @@
  			  RTL8373_MIR_CTRL_MIR_TX_ISOLATE_LKY_MASK | RTL8373_MIR_CTRL_MIR_RX_ISOLATE_LKY_MASK,
  			  0
  			);
-@@ -1932,6 +2450,13 @@ static const struct dsa_switch_ops rtl83
+@@ -1932,6 +2457,13 @@ static const struct dsa_switch_ops rtl83
  	.port_bridge_join = rtl8372n_port_bridge_join,
  	.port_bridge_leave = rtl8372n_port_bridge_leave,
  
@@ -1530,7 +1551,7 @@
  	.tag_8021q_vlan_add = rtl8372n_tag_8021q_vlan_add,
  	.tag_8021q_vlan_del = rtl8372n_tag_8021q_vlan_del,
  
-@@ -1944,7 +2469,6 @@ static const struct rtl837x_ops rtl8372n
+@@ -1944,7 +2476,6 @@ static const struct rtl837x_ops rtl8372n
  	.get_vlan_4k	= rtl8372n_get_vlan_4k,
  	.set_vlan_4k	= rtl8372n_set_vlan_4k,
  	.get_mib_counter = rtl8372n_get_mib_counter,

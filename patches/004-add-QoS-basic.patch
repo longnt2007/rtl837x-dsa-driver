@@ -48,7 +48,7 @@
  };
  
  /*
-@@ -2870,6 +2897,842 @@ static int rtl8372n_lag_fdb_del(struct d
+@@ -2866,6 +2893,842 @@ static int rtl8372n_lag_fdb_del(struct d
  	return ret;
  }
  
@@ -891,7 +891,7 @@
  enum RTL8373_MSTP_STATE
  {
      MSTP_DISABLE = 0,
-@@ -3205,6 +4068,10 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -3212,6 +4075,10 @@ static int rtl8372n_setup(struct dsa_swi
  	ret = rtl8372n_set_vlan_4k(priv, &def_vlan);
  	if (ret)
  		return ret;
@@ -902,7 +902,7 @@
  
  	/*
  	 * Warning! 
-@@ -3419,6 +4286,15 @@ static const struct dsa_switch_ops rtl83
+@@ -3426,6 +4293,15 @@ static const struct dsa_switch_ops rtl83
  	.port_lag_change = rtl8372n_port_lag_change,
  	.lag_fdb_add     = rtl8372n_lag_fdb_add,
  	.lag_fdb_del     = rtl8372n_lag_fdb_del,
@@ -918,7 +918,7 @@
  
  	.tag_8021q_vlan_add = rtl8372n_tag_8021q_vlan_add,
  	.tag_8021q_vlan_del = rtl8372n_tag_8021q_vlan_del,
-@@ -3447,5 +4323,6 @@ const struct rtl837x_variant rtl8372n_va
+@@ -3454,5 +4330,6 @@ const struct rtl837x_variant rtl8372n_va
  	.num_lag_ids = RTL8372N_TRUNK_GROUPS,
  	.have_8224 = false,
  	.chip_data_sz = sizeof(struct rtl8372n),

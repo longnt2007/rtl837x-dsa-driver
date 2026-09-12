@@ -289,7 +289,7 @@
  static int rtl8372n_port_set_isolation(struct rtl837x_priv *priv, int port,
  					u32 mask)
  {
-@@ -2530,6 +2805,8 @@ static const struct dsa_switch_ops rtl83
+@@ -2537,6 +2812,8 @@ static const struct dsa_switch_ops rtl83
  	.port_mdb_add  = rtl8372n_port_mdb_add,
  	.port_mdb_del  = rtl8372n_port_mdb_del,
      .port_fast_age = rtl8372n_port_fast_age,

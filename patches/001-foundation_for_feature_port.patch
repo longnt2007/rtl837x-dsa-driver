@@ -217,7 +217,7 @@
  	return 0;
  }
  
-@@ -2000,6 +2073,7 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -1996,6 +2069,7 @@ static int rtl8372n_setup(struct dsa_swi
  		return -ENODEV;
  	}
  
@@ -225,7 +225,7 @@
  	chip_data->pcs[3].pcs.ops = &rtl8372n_sds_pcs_ops;
  #if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
  	chip_data->pcs[3].pcs.neg_mode = true;
-@@ -2219,7 +2293,7 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -2226,7 +2300,7 @@ static int rtl8372n_setup(struct dsa_swi
  		if (ret)
  			return ret;
  
