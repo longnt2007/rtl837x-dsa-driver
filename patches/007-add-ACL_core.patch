@@ -107,14 +107,6 @@
  	switch (proto) {
  	case DSA_TAG_PROTO_MXL862_8021Q:
  		ret = rtl8372n_teardown_tag_rtl(ds);
-@@ -1322,6 +1390,7 @@ static int rtl8372n_change_tag_protocol(
- 	}
- 	priv->tag_proto = proto;
- 
-+out_unlock:
- 	mutex_unlock(&chip_data->config_lock);
- 
- 	return 0;
 @@ -4573,6 +4642,1006 @@ static int rtl8372n_port_get_apptrust(st
  	return 0;
  }

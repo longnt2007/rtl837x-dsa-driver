@@ -196,7 +196,7 @@
  		ret = rtl837x_reg_bits_write(priv, RTL8373_VS_PORT_DFLT_SVID_ADDR(port), 
  				  RTL8373_VS_PORT_DFLT_SVID_PORT_DFLT_SVID_MASK(port), 0
  				);
-@@ -1152,9 +1221,11 @@ static int rtl8372n_change_tag_protocol(
+@@ -1152,33 +1221,39 @@ static int rtl8372n_change_tag_protocol(
  {
  	int ret;
      struct rtl837x_priv *priv = ds->priv;
@@ -208,16 +208,41 @@
  
  	switch (proto) {
  	case DSA_TAG_PROTO_MXL862_8021Q:
-@@ -1178,6 +1249,8 @@ static int rtl8372n_change_tag_protocol(
+ 		ret = rtl8372n_teardown_tag_rtl(ds);
+ 		if (ret)
+-			return ret;
++			goto out_unlock;
+ 		ret = rtl8372n_set_tag_8021q(ds);
+ 		if (ret)
+-			return ret;
++			goto out_unlock;
+ 		break;
+ 	case DSA_TAG_PROTO_RTL8_4:
+ 		ret = rtl8372n_teardown_tag_8021q(ds);
+ 		if (ret)
+-			return ret;
++			goto out_unlock;
+ 		ret = rtl8372n_set_tag_rtl(ds);
+ 		if (ret)
+-			return ret;
++			goto out_unlock;
+ 		break;
+ 	default:
+-		return -EPROTONOSUPPORT;
++		ret = -EPROTONOSUPPORT;
++		goto out_unlock;
  	}
  	priv->tag_proto = proto;
  
+-	return 0;
++out_unlock:
 +	mutex_unlock(&chip_data->config_lock);
 +
- 	return 0;
++	return ret;
  }
  
-@@ -1996,6 +2069,7 @@ static int rtl8372n_setup(struct dsa_swi
+ static int rtl8372n_port_set_isolation(struct rtl837x_priv *priv, int port,
+@@ -2015,6 +2090,7 @@ static int rtl8372n_setup(struct dsa_swi
  		return -ENODEV;
  	}
  
@@ -225,7 +250,7 @@
  	chip_data->pcs[3].pcs.ops = &rtl8372n_sds_pcs_ops;
  #if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
  	chip_data->pcs[3].pcs.neg_mode = true;
-@@ -2226,7 +2300,7 @@ static int rtl8372n_setup(struct dsa_swi
+@@ -2241,7 +2317,7 @@ static int rtl8372n_setup(struct dsa_swi
  		if (ret)
  			return ret;
  
