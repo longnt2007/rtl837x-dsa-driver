@@ -1,0 +1,165 @@
+--- a/src/rtl837x.h
++++ b/src/rtl837x.h
+@@ -227,8 +227,6 @@ struct rtl837x_ops {
+ 			       struct rtl837x_vlan_4k *vlan4k);
+ 	int	(*set_vlan_4k)(struct rtl837x_priv *priv,
+ 			       const struct rtl837x_vlan_4k *vlan4k);
+-	int	(*enable_vlan)(struct rtl837x_priv *priv, bool enable);
+-
+ 	int	(*phy_read_c22)(struct rtl837x_priv *priv, u16 phy, int regnum,
+ 				u16 *pval);
+ 	int	(*phy_write_c22)(struct rtl837x_priv *priv, u16 phy, int regnum,
+--- a/src/rtl8372n.c
++++ b/src/rtl8372n.c
+@@ -10,6 +10,7 @@
+ #include <linux/dcbnl.h>
+ #include <linux/jiffies.h>
+ #include <linux/unaligned.h>
++#include <net/devlink.h>
+ #include <net/dsa.h>
+ #include <net/flow_offload.h>
+ #include <net/pkt_sched.h>
+@@ -487,6 +488,8 @@ static int rtl8372n_detect(struct rtl837
+ 	switch (sw_chip) {
+         case CHIP_RTL8372N:
+             dev_info(dev, "found an %s switch\n", chipid_to_chip_name(sw_chip));
++            priv->chip_id = sw_chip;
++            priv->chip_name = chipid_to_chip_name(sw_chip);
+             priv->num_ports = RTL8372N_NUM_PORTS;
+             priv->mib_counters = rtl8372n_mib_counters;
+             priv->num_mib_counters = ARRAY_SIZE(rtl8372n_mib_counters);
+@@ -931,11 +931,11 @@ static void rtl8372n_phylink_mac_link_down(struct phylink_config *config, unsign
+ 	switch (port)
+ 	{
+ 	case 4 ... 7:
+-		dev_info(priv->dev, "MAC link down on phy port (%d)\n", port);
++		//dev_info(priv->dev, "MAC link down on phy port (%d)\n", port);
+ 		break;
+ 	case 3:
+ 	case 8:
+-		dev_info(priv->dev, "MAC link down on serdes port (%d)\n", PORT_TO_SERDES_IDX(port));
++		//dev_info(priv->dev, "MAC link down on serdes port (%d)\n", PORT_TO_SERDES_IDX(port));
+ 		break;
+ 	}
+ 
+@@ -958,7 +958,7 @@ static void rtl8372n_phylink_mac_link_up(struct phylink_config *config,
+ 	switch (port)
+ 	{
+ 	case 4 ... 7:
+-		dev_info(priv->dev, "MAC link up on phy port(%d)\n", port);
++		//dev_info(priv->dev, "MAC link up on phy port(%d)\n", port);
+ 		break;
+ 	case 3:
+ 	case 8:
+@@ -5691,6 +5694,83 @@ static void rtl8372n_port_stp_state_set(
+ 	}
+ }
+ 
++enum rtl8372n_rma_action {
++    RTL8372N_RMA_ACTION_FORWARD = 0,
++    RTL8372N_RMA_ACTION_TRAP_TO_CPU = 1,
++    RTL8372N_RMA_ACTION_DROP = 2,
++    RTL8372N_RMA_ACTION_FORWARD_EXCLUDE_CPU = 3,
++};
++
++static int rtl8372n_setup_stp_bpdu_trap(struct rtl837x_priv *priv)
++{
++    /*
++     * RMA index 0x00:
++     * Destination MAC 01:80:c2:00:00:00
++    * IEEE 802.1D STP / RSTP / MSTP BPDU.
++     *
++     * Trap packet to CPU so Linux bridge/STP receives it.
++     * Do not let ASIC forward/flood it between user ports.
++     */
++    return rtl837x_reg_bits_write(priv,
++        RTL8373_RMA_OP_CTRL_00_ADDR,
++        RTL8373_RMA_OP_CTRL_00_RMA_ACT_00_MASK,
++        RTL8372N_RMA_ACTION_TRAP_TO_CPU);
++}
++
++static void rtl8372n_teardown(struct dsa_switch *ds)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	int ret;
++
++	rtnl_lock();
++	switch (priv->tag_proto) {
++		case DSA_TAG_PROTO_MXL862_8021Q:
++			ret = rtl8372n_teardown_tag_8021q(ds);
++			break;
++		case DSA_TAG_PROTO_RTL8_4:
++			ret = rtl8372n_teardown_tag_rtl(ds);
++			break;
++		default:
++			ret = 0;
++			break;
++	}
++	rtnl_unlock();
++
++	if (ret)
++		dev_err(priv->dev, "[%s]: failed to tear down tag protocol: %d\n",
++			__func__, ret);
++}
++
++static int rtl8372n_devlink_info_get(struct dsa_switch *ds,
++				      struct devlink_info_req *req,
++				      struct netlink_ext_ack *extack)
++{
++	struct rtl837x_priv *priv = ds->priv;
++
++	if (!priv->chip_name)
++		return -ENODEV;
++
++	return devlink_info_version_fixed_put(req,
++			  DEVLINK_INFO_VERSION_GENERIC_ASIC_ID, priv->chip_name);
++}
++
++static void rtl8372n_get_pause_stats(struct dsa_switch *ds, int port,
++				      struct ethtool_pause_stats *pause_stats)
++{
++	struct rtl837x_priv *priv = ds->priv;
++	const struct rtl837x_mib_counter *mib;
++
++	mutex_lock(&priv->mib_lock);
++
++	mib = &priv->mib_counters[RTL837X_MIB_dot3InPauseFrames];
++	priv->ops->get_mib_counter(priv, port, mib, &pause_stats->rx_pause_frames);
++
++	mib = &priv->mib_counters[RTL837X_MIB_dot3OutPauseFrames];
++	priv->ops->get_mib_counter(priv, port, mib, &pause_stats->tx_pause_frames);
++
++	mutex_unlock(&priv->mib_lock);
++}
++
+ static int rtl8372n_setup(struct dsa_switch *ds)
+ {
+     int ret;
+@@ -6171,6 +6251,10 @@ static int rtl8372n_setup(struct dsa_swi
+ 	if (ret)
+ 		return ret;
+ 
++	ret = rtl8372n_setup_stp_bpdu_trap(priv);
++	if (ret)
++		return ret;
++
+     return 0;
+ }
+ 
+@@ -6178,6 +6262,8 @@ static const struct dsa_switch_ops rtl83
+ 	.get_tag_protocol = rtl8372n_get_tag_protocol,
+ 	.change_tag_protocol = rtl8372n_change_tag_protocol,
+ 	.setup = rtl8372n_setup,
++	.teardown = rtl8372n_teardown,
++	.devlink_info_get = rtl8372n_devlink_info_get,
+ 
+ 	.phylink_get_caps = rtl8372n_phylink_get_caps,
+ 
+@@ -6187,6 +6273,7 @@ static const struct dsa_switch_ops rtl83
+ 	.get_eth_phy_stats = rtl8372n_get_phy_stats,
+ 	.get_eth_mac_stats = rtl8372n_get_mac_stats,
+ 	.get_eth_ctrl_stats = rtl8372n_get_ctrl_stats,
++	.get_pause_stats = rtl8372n_get_pause_stats,
+ 
+ 	.port_vlan_filtering = rtl8372n_vlan_filtering,
+ 	.port_vlan_add = rtl8372n_vlan_add,

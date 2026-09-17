@@ -1,0 +1,420 @@
+--- a/src/rtl837x_common.c
++++ b/src/rtl837x_common.c
+@@ -428,6 +428,11 @@ int rtl837x_phy_bits_write_c45(struct rtl837x_priv *priv, int phy, int devad, in
+ 	int ret;
+ 	u16 val;
+ 
++	/* Fast path: full-register write, nothing to preserve from the
++	 * old value, so skip the read-modify-write entirely. */
++	if (mask == 0xffff)
++		return __rtl837x_phys_write_c45(priv, BIT(phy), devad, regnum, data);
++	
+ 	mutex_lock(&priv->phy_lock);
+ 	ret = __rtl837x_phy_read_c45(priv, phy, devad, regnum, &val);
+ 	if (ret)
+--- a/src/rtl837x_intphy_patch.c
++++ b/src/rtl837x_intphy_patch.c
+@@ -873,6 +873,355 @@ static int data_ram_write_8b(struct rtl837x_priv *priv, int phy, u16 addr, u16 v
+ 	return 0;
+ }
+ 
++/* ------------------------------------------------------------------
++ * Broadcast (phy_mask) variants of the SRAM helpers above.
++ *
++ * rtl837x_phys_write_c45() already accept a phy_mask and broadcasts
++ * the value to every port in one MDIO transaction -- that part is free
++ * and requires no assumption at all, since a full-register write
++ * discards whatever was there before regardless of port.  
++ *
++ * For a MASKED write narrower than the full register (a true
++ * read-modify-write), we do NOT broadcast: without Realtek
++ * documentation or verified testing confirming the unmasked bits are
++ * identical across every PHY in phy_mask, assuming so and broadcasting
++ * a value read from a single representative port risks silently
++ * corrupting unrelated bits on the other ports. Fall back to a
++ * per-PHY loop calling the original, unmodified
++ * rtl837x_phy_bits_write_c45() -- exact same semantics as the
++ * pre-patch code, just called once per set bit in phy_mask instead of
++ * being looped by the caller.
++ *
++ * Net effect: every call site in patch_phys_v008_apply() below is
++ * unchanged -- only this dispatch changes -- and the big patch tables
++ * (rst_smtr_patch_*, n2_patch_*, uc2_patch_*, uc_patch_*), which were
++ * always full-register writes via rtl837x_phys_write_c45() and never
++ * touched this function at all, keep their full broadcast speedup.
++ * ------------------------------------------------------------------ */
++
++static int rtl837x_phys_bits_write_c45(struct rtl837x_priv *priv, u16 phy_mask,
++					int devad, int regnum, u16 mask, u16 data)
++{
++	int ret;
++
++	if (!phy_mask)
++		return 0;
++
++	/* Full-register write: safe to broadcast, no read/assumption
++	 * of any kind involved. */
++	if (mask == 0xffff)
++		return rtl837x_phys_write_c45(priv, phy_mask, devad, regnum, data);
++
++	/* Partial mask: a real read-modify-write. Preserve exact
++	 * per-PHY semantics with a plain loop rather than assuming
++	 * uniformity across ports. */
++	for (int p = 0; p < 8; p++) {
++		if (!(phy_mask & BIT(p)))
++			continue;
++		ret = rtl837x_phy_bits_write_c45(priv, p, devad, regnum, mask, data);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int uc1_sram_write_16b_mask(struct rtl837x_priv *priv, u16 phy_mask, u16 addr, u16 val)
++{
++	int ret;
++	ret = rtl837x_phys_write_c45(priv, phy_mask, 31, 0xa436, addr);
++	if (ret) return ret;
++	ret = rtl837x_phys_write_c45(priv, phy_mask, 31, 0xa438, val);
++	if (ret) return ret;
++	return 0;
++}
++
++static int uc1_sram_write_8b_mask(struct rtl837x_priv *priv, u16 phy_mask, u16 addr, u16 val)
++{
++	int ret;
++	ret = rtl837x_phys_write_c45(priv, phy_mask, 31, 0xa436, addr);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, phy_mask, 31, 0xa438, 0xff<<8, val);
++	if (ret) return ret;
++	return 0;
++}
++
++static int uc2_sram_write_8b_mask(struct rtl837x_priv *priv, u16 phy_mask, u16 addr, u16 val)
++{
++	int ret;
++	ret = rtl837x_phys_write_c45(priv, phy_mask, 31, 0xb87c, addr);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, phy_mask, 31, 0xb87e, 0xff<<8, val);
++	if (ret) return ret;
++	return 0;
++}
++
++/*
++ * Per-port eligibility check for patch v008. This CANNOT be broadcast:
++ * ic_ver/fw_ver are read back per-PHY and may legitimately differ
++ * between ports (e.g. a port already patched from a previous probe,
++ * or a port whose internal PHY reports a different ic_ver). Only the
++ * bulk WRITE sequence below is batched across ports.
++ */
++static int patch_phy_v008_needs_patch(struct rtl837x_priv *priv, int phy, bool *needs)
++{
++	int ret;
++	u16 ic_ver, fw_ver;
++	const u16 fw_ver_want = 0x008;
++
++	*needs = false;
++
++	ret = uc1_sram_read_8b(priv, phy, 0x0005, &ic_ver);
++	if (ret) return ret;
++	if (ic_ver != 2)
++		return 0;
++
++	ret = uc1_sram_read_16b(priv, phy, 0x801e, &fw_ver);
++	if (ret) return ret;
++
++	dev_dbg(priv->dev, "[%s]: port %d fw_ver read: 0x%04X want: 0x%04x\n",
++		__func__, phy, fw_ver, fw_ver_want);
++
++	*needs = (fw_ver != fw_ver_want);
++	return 0;
++}
++
++/*
++ * Wait for a status bit on every port in phy_mask. Reads cannot be
++ * broadcast (each port's status register is independent), so this
++ * still loops per-port -- but it only runs a handful of times per
++ * patch application, unlike the multi-thousand-entry table writes
++ * below, so the per-port loop cost here is negligible in comparison.
++ */
++static int patch_phy_v008_wait_mask(struct rtl837x_priv *priv, u16 phy_mask,
++				     u16 reg, u16 bitmask, u16 want)
++{
++	int ret, ret1;
++	u16 tmp16;
++
++	for (int p = 0; p < 8; p++) {
++		if (!(phy_mask & BIT(p)))
++			continue;
++
++		ret = read_poll_timeout(rtl837x_phy_bits_read_c45, ret1,
++				  (tmp16 == want) || (ret1),
++				  50, 250*1000, true,
++				  priv, p, 31, reg, bitmask, &tmp16);
++		if (ret) return ret;
++		if (ret1) return ret1;
++	}
++	return 0;
++}
++
++/*
++ * Bulk write phase of patch v008, applied once to every port in
++ * patch_mask via broadcast MDIO writes instead of once per port.
++ * This is a 1:1 mechanical port of the original patch_phy_v008()
++ * write sequence -- same registers, same order, same values -- only
++ * the transport (single phy -> phy_mask broadcast) changed. Table
++ * contents (rst_smtr_patch_..., n2_patch_..., uc2_patch_...,
++ * uc_patch_..., data_ram_patch_...) are untouched.
++ */
++static int patch_phys_v008_apply(struct rtl837x_priv *priv, u16 patch_mask)
++{
++	int ret;
++
++	/* Patch request */
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb820, 1<<4, 1);
++	if (ret) return ret;
++
++	/* wait patch ready (per-port read, cannot be broadcast) */
++	ret = patch_phy_v008_wait_mask(priv, patch_mask, 0xb800, 1<<6, 1);
++	if (ret) return ret;
++
++	/* Set Patch key */
++	ret = uc1_sram_write_16b_mask(priv, patch_mask, 0x8023, 0x1802);
++	if (ret) return ret;
++	/* Patch lock */
++	ret = uc1_sram_write_16b_mask(priv, patch_mask, 0xb82e, 1);
++	if (ret) return ret;
++
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb820, 1<<7, 1);
++	if (ret) return ret;
++
++	// n0_patch_RL6818C_230703 start
++	for (int i=0; i<sizeof(rst_smtr_patch_6818C_230703_patch)/(sizeof(u16)*2); i++)
++	{
++		ret = rtl837x_phys_write_c45(priv, patch_mask, 31,
++			  rst_smtr_patch_6818C_230703_patch[i][0],
++			  rst_smtr_patch_6818C_230703_patch[i][1]
++			);
++		if (ret) return ret;
++	}
++	// n0_patch_RL6818C_230703 stop
++
++	// n2_patch_6818C_231206 start
++	for (int i=0; i<sizeof(n2_patch_6818C_231206_patch)/(sizeof(u16)*2); i++)
++	{
++		ret = rtl837x_phys_write_c45(priv, patch_mask, 31,
++			  n2_patch_6818C_231206_patch[i][0],
++			  n2_patch_6818C_231206_patch[i][1]
++			);
++		if (ret) return ret;
++	}
++	// n2_patch_6818C_231206 stop
++
++	// uc2_patch_6818C_231206 start
++	for (int i=0; i<sizeof(uc2_patch_6818C_231206_patch)/(sizeof(u16)*2); i++)
++	{
++		ret = rtl837x_phys_write_c45(priv, patch_mask, 31,
++			  uc2_patch_6818C_231206_patch[i][0],
++			  uc2_patch_6818C_231206_patch[i][1]
++			);
++		if (ret) return ret;
++	}
++	// uc2_patch_6818C_231206 stop
++
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb820, 1<<7, 0);
++	if (ret) return ret;
++
++	// uc_patch_6818C_221117 start
++	for (int i=0; i<sizeof(uc_patch_6818C_221117_patch)/(sizeof(u16)*2); i++)
++	{
++		ret = rtl837x_phys_write_c45(priv, patch_mask, 31,
++			  uc_patch_6818C_221117_patch[i][0],
++			  uc_patch_6818C_221117_patch[i][1]
++			);
++		if (ret) return ret;
++	}
++	// uc_patch_6818C_221117 stop
++
++	/* ------------------ Data RAM Patch ------------------ */
++	// data_ram_patch_6818C_221026 start
++	ret= rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb896 , 0x01, 0); // disable data_mem_auto_inc
++	if (ret) return ret;
++	ret= rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb892 , 0xff00, 0); // set uc2 data ram page
++	if (ret) return ret;
++	for (int i=0; i<sizeof(data_ram_patch_6818C_221026_patch)/(sizeof(u16)*2); i++)
++	{
++		/* data_ram_write_8b() itself is not broadcastable as-is
++		 * (uses rtl837x_phy_write_c45()/bits_write_c45() with a
++		 * single phy). Loop per-port here; this table is small
++		 * relative to the multi-thousand-entry ones above, so the
++		 * remaining per-port cost is minor. If profiling shows
++		 * this table is also large, add a masked variant of
++		 * data_ram_write_8b() the same way as the helpers above. */
++		for (int p = 0; p < 8; p++) {
++			if (!(patch_mask & BIT(p)))
++				continue;
++			ret = data_ram_write_8b(priv, p,
++				  data_ram_patch_6818C_221026_patch[i][0],
++				  data_ram_patch_6818C_221026_patch[i][1]
++				);
++			if (ret) return ret;
++		}
++	}
++	ret= rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb896 , 0x01, 1); // enable data_mem_auto_inc
++	if (ret) return ret;
++	// data_ram_patch_6818C_221026 stop
++
++	// Clear patch_key & patch_lock
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xa436, 0xffff, 0);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xa438, 0xffff, 0);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb82e, 1, 0);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xa436, 0xffff, 0x8023);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xa438, 0xffff, 0);
++	if (ret) return ret;
++
++	// Patch request release
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xb820, 1<<4, 0);
++	if (ret) return ret;
++
++	// Wait patch ready==0 (per-port read, cannot be broadcast)
++	ret = patch_phy_v008_wait_mask(priv, patch_mask, 0xb800, 1<<6, 0);
++	if (ret) return ret;
++
++	// Lock Main
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xa4a0, 1<<10, 1);
++	if (ret) return ret;
++
++	// Wait pcs status == 1 (per-port read, cannot be broadcast)
++	ret = patch_phy_v008_wait_mask(priv, patch_mask, 0xa600, 0xff, 1);
++	if (ret) return ret;
++
++	// RTCT patch
++	// RTCT_para_6818C_231206 start
++	for (int i=0; i<sizeof(RTCT_para_6818C_231206_patch)/(sizeof(u16)*4); i++)
++	{
++		ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31,
++				  RTCT_para_6818C_231206_patch[i][0],
++				  __GENMASK(RTCT_para_6818C_231206_patch[i][1], RTCT_para_6818C_231206_patch[i][2]),
++				  RTCT_para_6818C_231206_patch[i][3]);
++		if (ret) return ret;
++	}
++	// RTCT_para_6818C_231206 end
++
++	ret = uc1_sram_write_8b_mask(priv, patch_mask, 0x8ffb, 0x01);
++	if (ret) return ret;
++	ret = uc1_sram_write_8b_mask(priv, patch_mask, 0x80dc, 0x0a);
++	if (ret) return ret;
++	ret = uc1_sram_write_8b_mask(priv, patch_mask, 0x8378, 0x22);
++	if (ret) return ret;
++
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xa47e, 0x3<<6, 0x1);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8217, 0x1e);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8384, 0x04);
++	if (ret) return ret;
++
++	// add for sub_echo_chnest
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fd6, 0x00);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fd7, 0x00);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fd8, 0x0c);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fd9, 0x80);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fda, 0x0a);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fdb, 0x19);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fdc, 0x19);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fdd, 0x00);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fde, 0x00);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fdf, 0x00);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fe0, 0x00);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fe1, 0x20);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fe2, 0x0c);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fd3, 0x00);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fd4, 0x15);
++	if (ret) return ret;
++	ret = uc2_sram_write_8b_mask(priv, patch_mask, 0x8fd5, 0x15);
++	if (ret) return ret;
++
++	// afe_patch_6818C_220607 start
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xbf84, 0x7, 4);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xbf8c, 0x1f<<6, 0);
++	if (ret) return ret;
++	// afe_patch_6818C_220607 end
++
++	ret = rtl837x_phys_write_c45(priv, patch_mask, 31, 0xa5d0, 0);
++	if (ret) return ret;
++	ret = rtl837x_phys_bits_write_c45(priv, patch_mask, 31, 0xa428, 1<<9, 0);
++	if (ret) return ret;
++
++	return 0;
++}
++
+ int patch_phy_v008(struct rtl837x_priv *priv, int phy)
+ {
+ 	int ret=0, ret1=0;
+@@ -1130,17 +1479,40 @@ int patch_phy_v008_rls_lockmain(struct rtl837x_priv *priv, int phy)
+ int patch_phys_v008(struct rtl837x_priv *priv, u16 phy_mask)
+ {
+ 	int ret;
+-	for (int p=0; p<8;p++)
+-	{
+-		if (!(phy_mask&BIT(p)))
++	u16 patch_mask = 0;
++
++	/* Phase 1: per-port eligibility check. This keeps exactly the
++	 * same number of MDIO reads as the original implementation --
++	 * only the write phase below is batched. */
++	for (int p = 0; p < 8; p++) {
++		bool needs;
++
++		if (!(phy_mask & BIT(p)))
+ 			continue;
+ 
+-		ret = patch_phy_v008(priv, p);
+-		if (ret)
+-			dev_err(priv->dev, "Failed to apply patch_phy_v008 port(%d)\n", p);
++		ret = patch_phy_v008_needs_patch(priv, p, &needs);
++		if (ret) {
++			dev_err(priv->dev, "Failed to check patch_phy_v008 port(%d)\n", p);
++			continue;
++		}
++		if (needs)
++			patch_mask |= BIT(p);
+ 	}
++
++	if (!patch_mask) {
++		dev_info(priv->dev, "Apply patch_phy_v008 Finish (nothing to do)\n");
++		return 0;
++	}
++
++	/* Phase 2: apply the identical patch sequence to every eligible
++	 * port in a single broadcast pass instead of once per port. */
++	ret = patch_phys_v008_apply(priv, patch_mask);
++	if (ret)
++		dev_err(priv->dev, "Failed to apply patch_phys_v008 mask(0x%02x): %d\n",
++			patch_mask, ret);
++
+ 	dev_info(priv->dev, "Apply patch_phy_v008 Finish\n");
+-	return 0;
++	return ret;
+ }
+ 
+ int patch_phys_v008_rls_lockmain(struct rtl837x_priv *priv, u16 phy_mask)
